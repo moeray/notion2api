@@ -47,3 +47,23 @@ POST https://app.notion.com/api/v3/getAppConfig
   解密链路：keychain `Chrome Safe Storage` → PBKDF2(saltysalt, 1003, 16)
   → AES-CBC(v10 前缀，明文从偏移 16 起，尾部按 PKCS7 去填充)。
 - `start.sh` / `stop.sh` — 起停 uvicorn（127.0.0.1:8000）。
+
+## 4. patch_agent.py —— 让「只会聊天」的模型真正产出代码
+
+反代不支持 function calling，模型没法自己读写文件。解决办法是让它只负责出
+**unified diff**，落地交给本地 `git apply`，人始终在环上：
+
+```bash
+python patch_agent.py "给 calc.py 加 divide，除零抛 ValueError" -f calc.py          # 先看补丁
+python patch_agent.py "..." -f calc.py --apply                                      # 校验后落盘
+python patch_agent.py "..." -f src/ -m claude-opus5.5 --apply                       # 整个目录
+```
+
+实现要点：
+- 指令写在 **user 消息**里（system 角色会被 Notion 的身份提示压过，实测无效）；
+- 只要求输出 diff，用正则从 ```diff 代码块里抠出来；
+- `git apply --recount` 兜底 —— 模型算错 `@@` 行数是常态，实测必踩；
+  失败再退 `--recount --3way` → `patch -p1`。
+
+实测通过：新增函数 + 类型校验、新建 `test_calc.py`（6 个 unittest 全绿），
+且未破坏原有函数。
