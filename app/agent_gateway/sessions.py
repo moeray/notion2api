@@ -155,9 +155,9 @@ def incremental_prompt(prompt, record):
     mode = "initial" if not record else "append" if append else "resync"
     changes = {}
     for k, v in settings.items():
-        if not append or previous.get("settings", {}).get(k) != setting_hashes[k]:
+        if not previous or previous.get("settings", {}).get(k) != setting_hashes[k]:
             prior_blocks = previous.get("system_blocks", {}).get(k)
-            if append and prior_blocks is not None and isinstance(v, list):
+            if previous and prior_blocks is not None and isinstance(v, list):
                 current_blocks = [digest(b) for b in v]
                 if current_blocks[:len(prior_blocks)] == prior_blocks:
                     changes[k + "_append"] = v[len(prior_blocks):]
@@ -166,7 +166,7 @@ def incremental_prompt(prompt, record):
     pending_atoms = atoms[start:]
     kept = [compact_tool_result(atom) for atom in pending_atoms]
     payload = {"mode": mode, **changes, "messages": group(kept)}
-    unset = sorted(set(previous.get("settings", {})) - set(settings)) if append else []
+    unset = sorted(set(previous.get("settings", {})) - set(settings)) if previous else []
     if unset:
         payload["unset"] = unset
     if acknowledged and previous.get("tool_ids"):
@@ -179,7 +179,7 @@ def incremental_prompt(prompt, record):
         "same JSON content envelope. Resync replaces client history with supplied history.\n"
     )
     # The complete protocol description is needed only on initial binding/resync.
-    rendered = (preamble if not append else "") + instructions + MARKER + json.dumps(
+    rendered = (preamble if not previous else "") + instructions + MARKER + json.dumps(
         payload, ensure_ascii=False, separators=(",", ":"))
     return rendered, snapshot, fingerprint, mode
 

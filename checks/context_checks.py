@@ -92,3 +92,15 @@ class ContextChecks(unittest.IsolatedAsyncioTestCase):
                 await store.run(up,'s',make([{'role':'user','content':'u'*20000}]),'medium',json.loads)
             self.assertEqual(store.get('s'),{});self.assertEqual(up.writes,[])
             store.close()
+
+    def test_resync_does_not_resend_unchanged_large_system_or_tools(self):
+        system='Safety instructions '+ 's'*100000
+        tools=[{'name':'Read','input_schema':{'type':'object'}}]
+        _,snap,_,_=incremental_prompt(make([{'role':'user','content':'classify action A'}],system=system,tools=tools),{})
+        sent,_,_,mode=incremental_prompt(make([{'role':'user','content':'classify action B'}],system=system,tools=tools),{'snapshot':snap})
+        payload=json.loads(sent.split(MARKER)[1])
+        self.assertEqual(mode,'resync')
+        self.assertNotIn('system',payload)
+        self.assertNotIn('tools',payload)
+        self.assertIn('classify action B',sent)
+        self.assertLess(len(sent),1000)
