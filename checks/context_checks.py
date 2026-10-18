@@ -104,3 +104,9 @@ class ContextChecks(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('tools',payload)
         self.assertIn('classify action B',sent)
         self.assertLess(len(sent),1000)
+
+    def test_billing_header_filter_preserves_instructions_in_same_block(self):
+        sent,_,_,_=incremental_prompt(make([{'role':'user','content':'hello'}],
+            system='x-anthropic-billing-header: tracking\nNever modify protected files.'),{})
+        self.assertIn('Never modify protected files.',sent)
+        self.assertNotIn('x-anthropic-billing-header',sent)

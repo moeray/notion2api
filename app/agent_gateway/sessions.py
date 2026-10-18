@@ -64,8 +64,7 @@ def stable_directive(block):
     if block.get("type") != "text":
         return block
     text = block["text"]
-    if text.startswith("x-anthropic-billing-header:"):
-        return None
+    text = re.sub(r"^x-anthropic-billing-header:[^\n]*(?:\n|$)", "", text)
     text = re.sub(r"<total_tokens>\s*\d+ tokens left\s*</total_tokens>", "", text).strip()
     return {**block, "text": text} if text else None
 
