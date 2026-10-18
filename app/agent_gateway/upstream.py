@@ -130,7 +130,9 @@ class NotionAgent:
             raise ValueError("Only https://app.notion.com is supported")
         self.space_id = config["space_id"]
         self.account_scope = hashlib.sha256((config["user_id"] + ":" + self.space_id).encode()).hexdigest()
-        self.timeout = timeout or float(os.getenv("NOTION_GATEWAY_TIMEOUT", "900"))
+        self.timeout = timeout or float(os.getenv("NOTION_GATEWAY_TIMEOUT", "300"))
+        # Fail a turn whose transcript stops advancing instead of waiting out the full timeout.
+        self.idle_timeout = float(os.getenv("NOTION_GATEWAY_IDLE_TIMEOUT", "90"))
         headers = {k: v for k, v in config.get("headers", {}).items() if k.lower() in SESSION_HEADERS}
         headers.update({"origin": config["origin"], "referer": config["origin"] + "/chat",
                         "x-notion-space-id": self.space_id,
@@ -212,10 +214,12 @@ class NotionAgent:
     async def wait_for_turn(self, thread_id, cursor=None, after_sequence=-1, previous_turn_id=None, on_text=None,
                             stall_timeout=None):
         async with asyncio.timeout(self.timeout):
-            started = asyncio.get_running_loop().time()
+            loop = asyncio.get_running_loop()
+            started = progressed = loop.time()
             state = Transcript(after_sequence, previous_turn_id)
             state.cursor = cursor
             seen = ""
+            marker = None
             while True:
                 body = {"spaceId": self.space_id, "threadId": thread_id, "direction": "forward", "limit": 100}
                 if state.cursor:
@@ -235,8 +239,12 @@ class NotionAgent:
                     return result, state.cursor, state.sequence, state.turn_id
                 if state.session.get("pending_input"):
                     raise UpstreamError("Notion requested an internal action; local tool bridging cannot approve it")
-                if stall_timeout and not state.active and \
-                        asyncio.get_running_loop().time() - started > stall_timeout:
+                current = (state.sequence, state.active, len(state.partial_text()))
+                if current != marker:
+                    marker, progressed = current, loop.time()
+                elif state.active and self.idle_timeout > 0 and loop.time() - progressed > self.idle_timeout:
+                    raise UpstreamError(f"Notion turn made no progress for {self.idle_timeout:g}s", 504)
+                if stall_timeout and not state.active and loop.time() - started > stall_timeout:
                     # A workspace without quota may accept the turn and then never start it.
                     # Nothing was produced, so the caller may safely continue elsewhere.
                     raise UpstreamError(f"Notion workspace did not start the turn within {stall_timeout:g}s", 504,

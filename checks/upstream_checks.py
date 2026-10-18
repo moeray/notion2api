@@ -37,7 +37,7 @@ class UpstreamChecks(unittest.IsolatedAsyncioTestCase):
         from app.agent_gateway.server import messages
         body = json.dumps({'model':'claude-opus-5-5','max_tokens':64,'stream':True,
                            'messages':[{'role':'user','content':'test'}]}).encode()
-        app = SimpleNamespace(state=SimpleNamespace(lock=asyncio.Semaphore(1),sessions=None,
+        app = SimpleNamespace(state=SimpleNamespace(locks={},sessions=None,
             pool=SimpleNamespace(run=AsyncMock(side_effect=UpstreamError('too large',413,True)))))
         receive=AsyncMock(return_value={'type':'http.request','body':body,'more_body':False})
         request=Request({'type':'http','method':'POST','path':'/v1/messages',

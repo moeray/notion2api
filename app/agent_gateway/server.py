@@ -9,6 +9,7 @@ import os
 import secrets
 import time
 import uuid
+import weakref
 import httpx
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -32,6 +33,13 @@ MAX_REQUEST_BYTES = int(os.getenv("NOTION_GATEWAY_MAX_REQUEST_BYTES", "128000000
 
 def error_type(status):
     return {401: "authentication_error", 403: "permission_error", 429: "rate_limit_error"}.get(status, "api_error" if status >= 500 else "invalid_request_error")
+
+
+def session_lock(key):
+    lock = app.state.locks.get(key)
+    if lock is None:
+        lock = app.state.locks[key] = asyncio.Lock()
+    return lock
 
 
 def error_response(message, status=400):
@@ -83,7 +91,8 @@ async def lifespan(app):
     app.state.pool = WorkspacePool(members, skipped)
     app.state.routes = json.loads((LOCAL / "routes.json").read_text()) if (LOCAL / "routes.json").exists() else {}
     app.state.proxy_http = httpx.AsyncClient(timeout=httpx.Timeout(300, connect=20), follow_redirects=False)
-    app.state.lock = asyncio.Semaphore(1)
+    # One turn at a time per client session; separate sessions and side requests run concurrently.
+    app.state.locks = weakref.WeakValueDictionary()
     app.state.sessions = SessionStore(PROFILE_LOCAL / "gateway-sessions.sqlite3",
                                      namespace=app.state.upstream.account_scope, adopt_legacy=PROFILE == "default")
     try:
@@ -193,7 +202,7 @@ async def messages(request: Request):
         audit({"id": message_id, "event": "started", "protocol": "messages", "session_hash": session_key,
                "session_source": session_source})
         try:
-            async with app.state.lock:
+            async with session_lock(session_key):
                 result, info = await app.state.pool.run(app.state.sessions, session_key, prompt, effort, render,
                                                         progress, stateless=session_source == "side-request")
             result = {**result, "id": message_id}
@@ -221,17 +230,19 @@ async def messages(request: Request):
         live = not options["stop_sequences"] and options["schema"] is None
         task = asyncio.create_task(execute((lambda partial: updates.put_nowait(partial)) if live else None))
         streamed = ""
+        getter = None
         try:
             yield sse("message_start", message=message)
             while not task.done():
-                getter = asyncio.ensure_future(updates.get())
+                # Reuse one pending get() across pings so no orphaned waiter is left behind on disconnect.
+                if getter is None:
+                    getter = asyncio.ensure_future(updates.get())
                 finished, _ = await asyncio.wait({task, getter}, timeout=5, return_when=asyncio.FIRST_COMPLETED)
                 if getter not in finished:
-                    getter.cancel()
                     if not finished:
                         yield sse("ping")
                     continue
-                partial = getter.result()
+                partial, getter = getter.result(), None
                 while not updates.empty():
                     partial = updates.get_nowait()
                 text = leading_text(partial)
@@ -263,10 +274,13 @@ async def messages(request: Request):
             yield sse("error", error={"type": error_type(getattr(exc, "status", 502)),
                                       "message": str(exc) or "Notion turn timed out"})
         finally:
-            if not task.done():
-                task.cancel()
+            pending = [t for t in (task, getter) if t is not None and not t.done()]
+            for t in pending:
+                t.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
-                await task
+                await asyncio.gather(*pending, return_exceptions=True)
+            if task.done() and not task.cancelled():
+                task.exception()
 
     return StreamingResponse(stream(), media_type="text/event-stream",
                              headers={**headers, "cache-control": "no-cache", "x-accel-buffering": "no"})
@@ -350,7 +364,7 @@ async def responses(request: Request):
     async def execute():
         started = time.monotonic()
         try:
-            async with app.state.lock:
+            async with session_lock(session_key):
                 result, info = await app.state.pool.run(app.state.sessions, session_key, prompt, effort, render)
             result = {**result, "id": response_id, "created_at": initial["created_at"]}
             audit({"id": response_id, "event": "completed", "protocol": "responses", "model": body["model"],

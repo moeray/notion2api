@@ -2,7 +2,7 @@
 
 Only hashes of client history are retained. The last validated response is cached
 so retries preserve tool IDs. Never re-submit an inference with an unknown outcome.
-Call run() under the server's inference lock, including response validation/commit.
+Call run() under the server's per-session lock, including response validation/commit.
 """
 from __future__ import annotations
 
