@@ -82,6 +82,7 @@ notion-proxy
 ```
 
 看到 `127.0.0.1:8765` 后保持这个终端运行。关闭代理用 **Ctrl+C**；没有设置开机或登录自启。
+每次执行 `notion-proxy` 都会先关闭本项目之前启动的代理（包括卡住的），再启动新的。
 
 终端 B，进入你要开发的项目，然后任选一个客户端：
 
@@ -139,7 +140,7 @@ codex-notion
 .venv/bin/python scripts/setup_gateway.py --list-profiles
 ```
 
-使用团队空间：先在原代理终端按 Ctrl+C，再运行：
+使用团队空间：直接运行下面的命令（会自动关闭之前的代理）：
 
 ```sh
 notion-proxy --profile team
@@ -156,6 +157,10 @@ notion-proxy
 - **切换 workspace 后请新建客户端对话。恢复旧对话前，先启动它原来的 profile。** 客户端会把对话历史发给当前连接的 workspace，代理不会跨 workspace 迁移远端聊天，也不会替你自动选择旧空间。
 - 使用相同 profile 续聊、重启或刷新登录，原会话绑定会保留。若 profile 的账号/workspace 发生变化，会使用独立的绑定命名空间。
 
+### 新 thread 首轮输入上限
+
+每次新建 Notion thread（首次绑定、resync、auto mode 分类器等辅助请求、切换 workspace）时，首轮输入最多 60000 字符（`NOTION_GATEWAY_NEW_THREAD_MAX_CHARS`）。超出时先丢最早的历史，单条仍太长就保留开头和结尾、截掉中间。之后的轮次照常只发增量。
+
 ### 额度用完自动切换 workspace
 
 ```sh
@@ -165,7 +170,8 @@ notion-proxy --profile default --failover team,team2
 （也可以设置环境变量 `NOTION_GATEWAY_FAILOVER_PROFILES=team,team2`。）
 
 - 当前 workspace 返回 429 或额度用完时，代理会自动换到下一个 profile，同一个客户端对话继续进行，不需要新建。
-- 切换的那一轮会把客户端历史（最多 `NOTION_GATEWAY_MAX_SEND_CHARS`）重放到新 workspace 的新 thread，之后照常只发增量。
+- 切换的那一轮只把最近一段客户端历史（默认 60000 字符，`NOTION_GATEWAY_FAILOVER_SEED_CHARS`）带到新 workspace 的新 thread，之后照常只发增量。
+- 某个 workspace 接了请求但 10 秒内没有任何响应（常见于没额度），会直接换下一个，并冷却 600 秒（`NOTION_GATEWAY_STALL_TIMEOUT` / `NOTION_GATEWAY_STALL_COOLDOWN`）。最后一个候选不做这个判断。
 - 只在本轮答案还没交付给客户端时切换，工具调用不会重复执行。
 - 对话切过去后会留在新 workspace；原 workspace 恢复后也不会来回跳。冷却时间优先采用 Notion 返回的 `Retry-After`，否则默认 1800 秒（`NOTION_GATEWAY_EXHAUSTED_COOLDOWN`）。
 - 所有 workspace 都不可用时返回 429。启动时没有 Opus 5.5 权限的备用 profile 会被跳过，可在 `/health` 的 `workspaces` 字段查看每个 profile 的状态。
@@ -197,7 +203,7 @@ git pull --ff-only
 .venv/bin/python -m pip install -r requirements.txt
 ```
 
-然后在代理终端 Ctrl+C，重新执行 `notion-proxy`（命名 profile 加上对应参数）。更新无需重新导入有效的 Cookie，不要删除 `.local`。
+然后重新执行 `notion-proxy`（会自动关闭旧进程）（命名 profile 加上对应参数）。更新无需重新导入有效的 Cookie，不要删除 `.local`。
 
 Cookie 过期时，在浏览器重新登录并按第 2 节导入，指定原来的 profile，最后重启代理。密钥文件存在时初始化会保留它，不会让客户端配置突然失效。
 
@@ -229,7 +235,7 @@ macOS/Linux 不使用全局命令时，也可通过仓库 `.venv/bin/python` 和
 | `missing token_v2` 或账号/workspace 缺失 | 复制已登录的实际请求，包含 Cookie 和必要请求头；不要手工删字段 |
 | `Opus 5.5 is not enabled` | 当前 workspace 没有可用权限，先在网页确认；代理不会绕过权限或自动买席位 |
 | HTTP 401 / 403 | 检查登录是否失效、是否导入了正确账号和 workspace |
-| `already running` | 同一端口只需一个代理；如需换 profile，先停掉旧进程 |
+| `Could not stop previous Notion proxy` | 旧网关进程关不掉（例如属于其他用户），手动 `kill` 后重试 |
 | `createAgentThread` 400 / 超长上下文 413 | 18 万字节预算只检查提取增量后、JSON 转义后的 UTF-8 内容；中文和反斜杠也按实际大小计入。完整客户端历史可达 400 万字符（HTTP 请求另限 128 MB）。首次导入/重同步会按完整用户轮次移除最旧历史并告知模型；单轮仍超限时需压缩或分批 |
 | 回复看起来停顿 | SSE 会保持心跳，但 JSON 工具结果要完整生成并校验后才能发送 |
 | 偶尔又新建了一个 Notion 聊天 | 正常续轮复用；上次结果未确定而客户端上下文改变时，会用完整客户端历史在新 thread 恢复，避免执行旧工具结果 |

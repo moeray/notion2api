@@ -45,6 +45,14 @@ class ScopedNotion(FakeNotion):
             raise UpstreamError("quota", 429, rejected=True, exhausted=True)
         await super().start_turn(text, effort, thread, event, continuation)
 
+    async def wait_for_turn(self, thread, cursor, sequence, turn_id, stall_timeout=None):
+        self.stall_timeouts = getattr(self, "stall_timeouts", []) + [stall_timeout]
+        if getattr(self, "stalled", False):
+            if stall_timeout:
+                raise UpstreamError("stalled", 504, exhausted=True)
+            raise TimeoutError()
+        return await super().wait_for_turn(thread, cursor, sequence, turn_id)
+
 
 class SessionChecks(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -95,6 +103,38 @@ class SessionChecks(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(third["profile"], "b")
         self.assertEqual(third["thread_id"], second["thread_id"])
         self.assertEqual(b.writes[-1][1], True)
+
+    async def test_silent_workspace_fails_over_quickly(self):
+        a, b = ScopedNotion("a"), ScopedNotion("b")
+        a.stalled = True
+        pool = WorkspacePool([("a", a), ("b", b)])
+        _, info = await pool.run(self.store, "one", prompt(self.first), "medium", json.loads)
+        self.assertEqual(info["profile"], "b")
+        self.assertEqual(info["history_mode"], "failover")
+        self.assertIn("a", pool.cooling)
+        # Only non-final candidates get the short stall bound.
+        self.assertTrue(a.stall_timeouts[0])
+        self.assertIsNone(b.stall_timeouts[0])
+
+    def test_transcript_activity_ignores_own_message_and_quota_banner(self):
+        state = Transcript(5)
+        state.update({"patches": [
+            {"op": "put", "entity": {"id": "u", "kind": "user_message", "sequence": 6}},
+            {"op": "put", "entity": {"id": "rate-limit-status:s", "kind": "status", "sequence": 7}}]})
+        self.assertFalse(state.active)
+        state.update({"patches": [{"op": "put", "entity": {"id": "t", "kind": "thinking", "sequence": 8}}]})
+        self.assertTrue(state.active)
+
+    async def test_new_thread_input_is_capped(self):
+        from app.agent_gateway.sessions import NEW_THREAD_MAX_CHARS, wire_size
+        notion = FakeNotion()
+        huge = [{"role": "user", "content": "START-MARK " + "x" * 300000 + " END-MARK"}]
+        await self.store.run(notion, "big", prompt(huge), "medium", json.loads, stateless=True)
+        sent = notion.writes[0][2]
+        self.assertLessEqual(wire_size(sent), NEW_THREAD_MAX_CHARS + 2000)
+        self.assertIn("START-MARK", sent)
+        self.assertIn("END-MARK", sent)
+        self.assertIn("Bridge omitted", sent)
 
     async def test_all_workspaces_exhausted_returns_429(self):
         a, b = ScopedNotion("a"), ScopedNotion("b")

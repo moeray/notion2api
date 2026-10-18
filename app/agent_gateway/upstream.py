@@ -20,6 +20,9 @@ SESSION_HEADERS = {"user-agent", "notion-client-version", "notion-audit-log-plat
 QUOTA_MARKERS = ("rate limit", "ratelimit", "rate_limit", "quota", "credit", "usage limit", "exhausted")
 
 
+STALL_COOLDOWN = float(os.getenv("NOTION_GATEWAY_STALL_COOLDOWN", "600"))
+
+
 class UpstreamError(Exception):
     def __init__(self, message: str, status: int = 502, rejected: bool = False, exhausted: bool = False,
                  retry_after: float | None = None):
@@ -59,6 +62,9 @@ class Transcript:
         self.sequence = after_sequence
         self.previous_turn_id = previous_turn_id
         self.turn_id = None
+        # Any Notion-side entity after our message (thinking, output, completion) proves the
+        # workspace is serving this turn. Our own message and quota banners do not count.
+        self.active = False
 
     def update(self, page: dict):
         self.cursor = page.get("forward_cursor", self.cursor)
@@ -68,6 +74,9 @@ class Transcript:
             if patch.get("op") == "put":
                 entity = patch.get("entity", {})
                 self.sequence = max(self.sequence, entity.get("sequence", -1))
+                if entity.get("sequence", -1) > self.after_sequence and entity.get("kind") != "user_message" \
+                        and not str(entity.get("id", "")).startswith("rate-limit-status"):
+                    self.active = True
                 # Thinking and Notion's internal execution details are not relayed.
                 if entity.get("kind") in {"assistant_message", "turn_completed", "error"}:
                     self.entities[entity["id"]] = entity
@@ -200,8 +209,10 @@ class NotionAgent:
                 "browserEnabled": False, "clientMessageId": event_id,
             })
 
-    async def wait_for_turn(self, thread_id, cursor=None, after_sequence=-1, previous_turn_id=None, on_text=None):
+    async def wait_for_turn(self, thread_id, cursor=None, after_sequence=-1, previous_turn_id=None, on_text=None,
+                            stall_timeout=None):
         async with asyncio.timeout(self.timeout):
+            started = asyncio.get_running_loop().time()
             state = Transcript(after_sequence, previous_turn_id)
             state.cursor = cursor
             seen = ""
@@ -224,6 +235,12 @@ class NotionAgent:
                     return result, state.cursor, state.sequence, state.turn_id
                 if state.session.get("pending_input"):
                     raise UpstreamError("Notion requested an internal action; local tool bridging cannot approve it")
+                if stall_timeout and not state.active and \
+                        asyncio.get_running_loop().time() - started > stall_timeout:
+                    # A workspace without quota may accept the turn and then never start it.
+                    # Nothing was produced, so the caller may safely continue elsewhere.
+                    raise UpstreamError(f"Notion workspace did not start the turn within {stall_timeout:g}s", 504,
+                                        exhausted=True, retry_after=STALL_COOLDOWN)
                 await asyncio.sleep(0.75 if on_text else 1.5)
 
     async def complete(self, prompt: str, effort: str = "medium"):

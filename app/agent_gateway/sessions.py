@@ -28,6 +28,11 @@ THREAD_MAX_CHARS = int(os.getenv("NOTION_GATEWAY_THREAD_MAX_CHARS", "0"))
 ROLLOVER_SEED_CHARS = int(os.getenv("NOTION_GATEWAY_ROLLOVER_SEED_CHARS", "80000"))
 # Optional tighter bound for stateless side requests (0 = same as MAX_SEND_CHARS).
 SIDE_MAX_SEND_CHARS = int(os.getenv("NOTION_GATEWAY_SIDE_MAX_SEND_CHARS", "0"))
+# Recent history replayed onto the new workspace's thread on failover (keeps usage bounded).
+FAILOVER_SEED_CHARS = int(os.getenv("NOTION_GATEWAY_FAILOVER_SEED_CHARS", "60000"))
+# Hard cap on the first turn of every fresh Notion thread (initial, resync, side request, failover).
+# Notion bills the whole input of that turn, so big replays drain usage fast.
+NEW_THREAD_MAX_CHARS = int(os.getenv("NOTION_GATEWAY_NEW_THREAD_MAX_CHARS", "60000"))
 
 
 def digest(value):
@@ -147,6 +152,50 @@ def compact_tool_result(atom):
     return {**atom, "content": {**block, "content": [{"type": "text", "text": shortened}]}}
 
 
+def atom_text(atom):
+    block = atom["content"]
+    if block.get("type") == "text":
+        return block["text"]
+    if block.get("type") == "tool_result":
+        return "\n".join(b.get("text", "") for b in block["content"])
+    return None
+
+
+def with_text(atom, text):
+    block = atom["content"]
+    if block.get("type") == "text":
+        return {**atom, "content": {**block, "text": text}}
+    return {**atom, "content": {**block, "content": [{"type": "text", "text": text}]}}
+
+
+def shorten_middle(text, limit):
+    if len(text) <= limit:
+        return text
+    marker = (f"\n[Bridge omitted {len(text) - limit} characters from the middle of this item to bound "
+              "context; ask for or re-read details if needed.]\n")
+    half = max(0, (limit - len(marker)) // 2)
+    return text[:half] + marker + text[-half:] if half else marker
+
+
+def fit_atoms(atoms, limit):
+    """Shrink the largest text items (keeping head and tail) until the history fits limit."""
+    atoms, shortened = list(atoms), 0
+    for _ in range(2 * len(atoms)):
+        sizes = [size(a) for a in atoms]
+        excess = sum(sizes) - limit
+        if excess <= 0 or not atoms:
+            break
+        i = max(range(len(atoms)), key=sizes.__getitem__)
+        text = atom_text(atoms[i])
+        if text is None or len(text) < 4000:
+            break
+        ratio = len(text) / max(sizes[i], 1)
+        target = max(2000, int(len(text) - excess * ratio) - 500)
+        atoms[i] = with_text(atoms[i], shorten_middle(text, target))
+        shortened += 1
+    return atoms, shortened
+
+
 def drop_oldest(atoms, limit):
     """Drop the oldest history to fit limit, cutting only at user input so tool pairs stay intact."""
     sizes = [size(a) for a in atoms]
@@ -207,7 +256,13 @@ def incremental_prompt(prompt, record, budget=None):
     if not append:
         # A full-history send must fit; the oldest turns are the cheapest to lose.
         overhead = wire_size(preamble) + size({"mode": mode, **changes}) + 2000
-        kept, omitted = drop_oldest(kept, (budget or MAX_SEND_CHARS) - overhead)
+        cap = min(budget or MAX_SEND_CHARS, NEW_THREAD_MAX_CHARS or MAX_SEND_CHARS)
+        kept, omitted = drop_oldest(kept, cap - overhead)
+        if NEW_THREAD_MAX_CHARS:
+            # Shrinking single items only serves the usage cap; a turn still over
+            # MAX_SEND_CHARS is rejected explicitly below instead of being hidden.
+            kept, shortened = fit_atoms(kept, max(8000, NEW_THREAD_MAX_CHARS - overhead))
+            truncated += shortened
     payload = {"mode": mode, **changes, "messages": group(kept)}
     if omitted:
         payload["omitted_earlier_items"] = omitted
@@ -260,7 +315,7 @@ class SessionStore:
         with self.db:
             self.db.execute("INSERT OR REPLACE INTO sessions VALUES (?, ?)", (self.storage_key(key), json.dumps(record)))
 
-    async def run(self, upstream, key, prompt, effort, render, progress=None, stateless=False):
+    async def run(self, upstream, key, prompt, effort, render, progress=None, stateless=False, stall_timeout=None):
         record = self.get(key)
         sent, snapshot, fingerprint, mode = incremental_prompt(prompt, record)
         fingerprint = digest([fingerprint, effort])
@@ -277,8 +332,8 @@ class SessionStore:
             # was never delivered to the client, so no tool call can run twice.
             superseded = record
             record = {}
-            sent, snapshot, _, _ = incremental_prompt(prompt, record,
-                                                      (SIDE_MAX_SEND_CHARS or None) if stateless else None)
+            sent, snapshot, _, _ = incremental_prompt(prompt, record, (SIDE_MAX_SEND_CHARS or None) if stateless
+                                                      else (FAILOVER_SEED_CHARS or None))
             mode = "failover"
             pending = None
         elif stateless and not same:
@@ -332,7 +387,8 @@ class SessionStore:
         if "answer" not in pending:
             text, cursor, sequence, turn_id = await upstream.wait_for_turn(
                 record["thread_id"], record.get("cursor"), record.get("sequence", -1), record.get("turn_id"),
-                **({"on_text": progress} if progress is not None else {}))
+                **({"on_text": progress} if progress is not None else {}),
+                **({"stall_timeout": stall_timeout} if stall_timeout else {}))
             pending.update(answer=text, cursor=cursor, sequence=sequence, turn_id=turn_id)
             record["thread_chars"] = record.get("thread_chars", 0) + pending["input_chars"] + len(text)
             self.save(key, record)

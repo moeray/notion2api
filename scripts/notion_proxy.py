@@ -1,15 +1,56 @@
 #!/usr/bin/env python3
 """One manual command to start the gateway; never installs login autostart."""
 import argparse
-import json
 import os
+import signal
+import subprocess
 import sys
-import urllib.request
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from app.agent_gateway.config import profile_path, venv_python
+
+
+def gateway_pids():
+    """PIDs of gateways started from this checkout (any port, including hung ones)."""
+    pattern = str(ROOT / 'scripts' / 'local_gateway.py')
+    try:
+        out = subprocess.run(['pgrep', '-f', pattern], capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return [int(p) for p in out.split() if p.isdigit() and int(p) != os.getpid()]
+
+
+def alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def stop_previous(grace=8.0):
+    pids = gateway_pids()
+    if not pids:
+        return
+    print(f'Stopping previous Notion proxy (pid {", ".join(map(str, pids))})...', flush=True)
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        for pid in pids:
+            try:
+                os.kill(pid, sig)
+            except ProcessLookupError:
+                pass
+        deadline = time.monotonic() + (grace if sig == signal.SIGTERM else 3)
+        while time.monotonic() < deadline and any(alive(p) for p in pids):
+            time.sleep(0.2)
+        pids = [p for p in pids if alive(p)]
+        if not pids:
+            return
+    raise SystemExit(f'Could not stop previous Notion proxy (pid {", ".join(map(str, pids))})')
 
 
 def main():
@@ -33,17 +74,7 @@ def main():
             parser.error(str(exc))
     if not (folder / 'notion-session.json').exists():
         parser.error('Profile is not configured. Run scripts/setup_gateway.py --help first.')
-    try:
-        with urllib.request.urlopen(f'http://127.0.0.1:{args.port}/health', timeout=2) as response:
-            health = json.load(response)
-        if health.get('tool_mode') != 'text-json-bridge':
-            parser.error('This port is occupied by another service')
-        if health.get('profile', 'default') != args.profile:
-            parser.error('Another profile is running on this port. Stop it with Ctrl+C before switching profiles.')
-        print(f'Notion proxy is already running at http://127.0.0.1:{args.port} (profile: {args.profile}).')
-        return
-    except (OSError, ValueError):
-        pass
+    stop_previous()
     python = venv_python()
     if not python.exists():
         parser.error('Missing .venv; create it and install requirements.txt first')
