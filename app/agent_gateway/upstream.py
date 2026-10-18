@@ -15,11 +15,35 @@ SESSION_HEADERS = {"user-agent", "notion-client-version", "notion-audit-log-plat
                    "x-notion-cell-hint", "x-notion-cell-hint-source"}
 
 
+# Body/stop-reason phrases meaning the workspace is out of AI quota (inspected, never relayed).
+QUOTA_MARKERS = ("rate limit", "ratelimit", "rate_limit", "quota", "credit", "usage limit", "exhausted")
+
+
 class UpstreamError(Exception):
-    def __init__(self, message: str, status: int = 502, rejected: bool = False):
+    def __init__(self, message: str, status: int = 502, rejected: bool = False, exhausted: bool = False,
+                 retry_after: float | None = None):
         super().__init__(message)
         self.status = status
         self.rejected = rejected
+        # Workspace quota/rate limit: the gateway may continue the session in another workspace.
+        self.exhausted = exhausted
+        self.retry_after = retry_after
+
+
+def quota_signal(response):
+    if response.status_code == 429:
+        return True
+    if not 400 <= response.status_code < 500 or response.status_code in {401, 403, 404, 408}:
+        return False
+    return any(marker in response.text[:4000].lower() for marker in QUOTA_MARKERS)
+
+
+def retry_after_seconds(response):
+    try:
+        value = float(response.headers.get("retry-after", ""))
+    except ValueError:
+        return None
+    return value if 0 < value <= 86400 else None
 
 
 class Transcript:
@@ -70,7 +94,9 @@ class Transcript:
         done = max(completed, key=lambda e: e.get("sequence", 0))
         self.turn_id = done.get("turn_id")
         if done.get("stop_reason") != "end_turn":
-            raise UpstreamError("Notion turn did not finish normally: " + str(done.get("stop_reason")))
+            reason = str(done.get("stop_reason"))
+            raise UpstreamError("Notion turn did not finish normally: " + reason,
+                                exhausted=any(marker in reason.lower() for marker in QUOTA_MARKERS))
         messages = sorted(
             (e for e in self.entities.values() if e.get("kind") == "assistant_message"
              and e.get("turn_id") == done.get("turn_id")),
@@ -116,7 +142,8 @@ class NotionAgent:
             status = response.status_code if response.status_code in {401, 403, 429} else 502
             # Never include arbitrary upstream response bodies, credentials or trace URLs.
             raise UpstreamError(f"Notion {endpoint} returned HTTP {response.status_code}", status,
-                                rejected=400 <= response.status_code < 500 and response.status_code != 408)
+                                rejected=400 <= response.status_code < 500 and response.status_code != 408,
+                                exhausted=quota_signal(response), retry_after=retry_after_seconds(response))
         try:
             return response.json()
         except ValueError:

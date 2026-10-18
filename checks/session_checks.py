@@ -6,6 +6,7 @@ from pathlib import Path
 from app.agent_gateway.protocol import prepare_request
 from app.agent_gateway.sessions import SessionStore, client_session, incremental_prompt
 from app.agent_gateway.upstream import Transcript, UpstreamError
+from app.agent_gateway.pool import WorkspacePool
 
 
 def prompt(messages, **extra):
@@ -31,6 +32,18 @@ class FakeNotion:
             raise TimeoutError()
         n = len(self.writes)
         return '{"content":[{"type":"text","text":"OK"}]}', f"cursor{n}", n * 10, f"turn{n}"
+
+
+class ScopedNotion(FakeNotion):
+    def __init__(self, scope):
+        super().__init__()
+        self.account_scope = scope
+        self.exhausted = False
+
+    async def start_turn(self, text, effort, thread, event, continuation):
+        if self.exhausted:
+            raise UpstreamError("quota", 429, rejected=True, exhausted=True)
+        await super().start_turn(text, effort, thread, event, continuation)
 
 
 class SessionChecks(unittest.IsolatedAsyncioTestCase):
@@ -59,6 +72,38 @@ class SessionChecks(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(first["thread_id"], second["thread_id"])
         self.assertEqual([w[1] for w in self.up.writes], [False, False])
         self.assertIn("Remember violet.", self.up.writes[1][2])
+
+    async def test_exhausted_workspace_fails_over_and_stays(self):
+        a, b = ScopedNotion("a"), ScopedNotion("b")
+        pool = WorkspacePool([("a", a), ("b", b)])
+
+        def run(messages):
+            return pool.run(self.store, "one", prompt(messages), "medium", json.loads)
+        _, first = await run(self.first)
+        a.exhausted = True
+        messages = self.first + [{"role": "assistant", "content": "OK"}, {"role": "user", "content": "What color?"}]
+        _, second = await run(messages)
+        self.assertEqual((first["profile"], second["profile"]), ("a", "b"))
+        self.assertEqual(second["history_mode"], "failover")
+        self.assertNotEqual(first["thread_id"], second["thread_id"])
+        self.assertEqual(b.writes[0][1], False)
+        self.assertIn("Remember violet.", b.writes[0][2])
+        a.exhausted = False
+        pool.cooling.clear()
+        _, third = await run(messages + [{"role": "assistant", "content": "OK"},
+                                         {"role": "user", "content": "And now?"}])
+        self.assertEqual(third["profile"], "b")
+        self.assertEqual(third["thread_id"], second["thread_id"])
+        self.assertEqual(b.writes[-1][1], True)
+
+    async def test_all_workspaces_exhausted_returns_429(self):
+        a, b = ScopedNotion("a"), ScopedNotion("b")
+        a.exhausted = b.exhausted = True
+        pool = WorkspacePool([("a", a), ("b", b)])
+        with self.assertRaises(UpstreamError) as ctx:
+            await pool.run(self.store, "one", prompt(self.first), "medium", json.loads)
+        self.assertEqual(ctx.exception.status, 429)
+        self.assertEqual(set(pool.cooling), {"a", "b"})
 
     async def test_resume_after_restart_and_new_session_isolation(self):
         _, first = await self.run_turn()

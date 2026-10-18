@@ -16,6 +16,9 @@ def profile_path(name):
 
 PROFILE = os.getenv("NOTION_GATEWAY_PROFILE", "default")
 PROFILE_LOCAL = profile_path(PROFILE)
+# Workspaces to continue in, in order, when the active one runs out of quota.
+FAILOVER = [n.strip() for n in os.getenv("NOTION_GATEWAY_FAILOVER_PROFILES", "").split(",") if n.strip()]
+PROFILES = list(dict.fromkeys([PROFILE, *FAILOVER]))
 
 
 def venv_python():

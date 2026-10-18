@@ -23,7 +23,8 @@ from .upstream import NotionAgent, UpstreamError, PUBLIC_MODEL
 from .responses import PICKER_MODEL, convert_request, convert_answer, response_object, output_events, response_usage
 from .routing import passthrough, HOP_HEADERS
 from .sessions import SessionStore, client_session
-from .config import ROOT, LOCAL, PROFILE, PROFILE_LOCAL, CATALOG
+from .config import ROOT, LOCAL, PROFILE, PROFILE_LOCAL, PROFILES, CATALOG, profile_path
+from .pool import WorkspacePool
 
 # Raw body bound only; base64 media is reduced to text markers before the payload is built.
 MAX_REQUEST_BYTES = int(os.getenv("NOTION_GATEWAY_MAX_REQUEST_BYTES", "128000000"))
@@ -53,15 +54,30 @@ async def lifespan(app):
     app.state.key = key_path.read_text().strip()
     if len(app.state.key) < 24:
         raise RuntimeError("Gateway key must contain at least 24 characters")
-    session_file = PROFILE_LOCAL / "notion-session.json"
-    if not session_file.exists():
-        raise RuntimeError("Notion profile is not configured. Run scripts/setup_gateway.py --help first.")
-    app.state.upstream = NotionAgent(session_file)
-    # An expired Notion session must not prevent existing provider routes from working.
-    try:
-        app.state.model = await app.state.upstream.verify_model()
-    except (UpstreamError, httpx.HTTPError) as exc:
-        app.state.model = {"id": PUBLIC_MODEL, "available": False, "error": str(exc)}
+    members, skipped, scopes = [], [], set()
+    for name in PROFILES:
+        session_file = profile_path(name) / "notion-session.json"
+        if not session_file.exists():
+            if name == PROFILE:
+                raise RuntimeError("Notion profile is not configured. Run scripts/setup_gateway.py --help first.")
+            skipped.append({"profile": name, "error": "not configured"})
+            continue
+        agent = NotionAgent(session_file)
+        # An expired Notion session must not prevent existing provider routes from working.
+        try:
+            model = await agent.verify_model()
+        except (UpstreamError, httpx.HTTPError) as exc:
+            model = {"id": PUBLIC_MODEL, "available": False, "error": str(exc)}
+        if name == PROFILE:
+            app.state.upstream, app.state.model = agent, model
+        elif model.get("available") is False or agent.account_scope in scopes:
+            # Never fail over into a workspace without verified Opus 5.5 access.
+            skipped.append({"profile": name, "error": model.get("error", "duplicate workspace")})
+            await agent.close()
+            continue
+        scopes.add(agent.account_scope)
+        members.append((name, agent))
+    app.state.pool = WorkspacePool(members, skipped)
     app.state.routes = json.loads((LOCAL / "routes.json").read_text()) if (LOCAL / "routes.json").exists() else {}
     app.state.proxy_http = httpx.AsyncClient(timeout=httpx.Timeout(300, connect=20), follow_redirects=False)
     app.state.lock = asyncio.Semaphore(1)
@@ -70,7 +86,8 @@ async def lifespan(app):
     try:
         yield
     finally:
-        await app.state.upstream.close()
+        for _, agent in app.state.pool.members:
+            await agent.close()
         await app.state.proxy_http.aclose()
         app.state.sessions.close()
 
@@ -98,7 +115,7 @@ async def local_auth(request, call_next):
 @app.get("/health")
 async def health():
     return {"status": "ok", "model": app.state.model, "tool_mode": "text-json-bridge", "usage": "estimated",
-            "session_mode": "persistent-client-thread", "profile": PROFILE}
+            "session_mode": "persistent-client-thread", "profile": PROFILE, "workspaces": app.state.pool.status()}
 
 
 @app.head("/api/hello")
@@ -155,8 +172,8 @@ async def messages(request: Request):
                "session_source": session_source})
         try:
             async with app.state.lock:
-                result, info = await app.state.sessions.run(app.state.upstream, session_key, prompt, effort, render,
-                                                            progress, stateless=session_source == "side-request")
+                result, info = await app.state.pool.run(app.state.sessions, session_key, prompt, effort, render,
+                                                        progress, stateless=session_source == "side-request")
             result = {**result, "id": message_id}
             audit({"id": message_id, "event": "completed", "model": PUBLIC_MODEL,
                    **info, "session_source": session_source, "duration_s": round(time.monotonic() - started, 2),
@@ -310,7 +327,7 @@ async def responses(request: Request):
         started = time.monotonic()
         try:
             async with app.state.lock:
-                result, info = await app.state.sessions.run(app.state.upstream, session_key, prompt, effort, render)
+                result, info = await app.state.pool.run(app.state.sessions, session_key, prompt, effort, render)
             result = {**result, "id": response_id, "created_at": initial["created_at"]}
             audit({"id": response_id, "event": "completed", "protocol": "responses", "model": body["model"],
                    **info, "session_source": session_source, "duration_s": round(time.monotonic() - started, 2),

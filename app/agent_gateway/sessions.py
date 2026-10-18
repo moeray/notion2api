@@ -261,7 +261,20 @@ class SessionStore:
             return record["result"], {**record["audit"], "cached": True}
         pending = record.get("pending")
         superseded = None
-        if stateless and not (pending and pending["fingerprint"] == fingerprint):
+        scope = getattr(upstream, "account_scope", None)
+        bound = record.get("scope") or self.namespace or scope
+        same = bool(pending) and pending["fingerprint"] == fingerprint
+        if record and scope and bound != scope and not (same and "answer" in pending):
+            # Workspace failover: this binding's thread lives in another workspace. Replay the
+            # authoritative client history onto a fresh thread here. An unfinished turn there
+            # was never delivered to the client, so no tool call can run twice.
+            superseded = record
+            record = {}
+            sent, snapshot, _, _ = incremental_prompt(prompt, record,
+                                                      (SIDE_MAX_SEND_CHARS or None) if stateless else None)
+            mode = "failover"
+            pending = None
+        elif stateless and not same:
             # Side requests (classifiers, schema calls) rewrite their prompt every time, so
             # they can never append. Notion re-reads the whole thread per turn: send each one
             # on a fresh thread instead of resyncing onto an ever-growing one.
@@ -290,7 +303,7 @@ class SessionStore:
                 raise UpstreamError(f"Turn payload {len(sent)} chars exceeds {MAX_SEND_CHARS}; "
                                     "compact the conversation", 413, rejected=True)
             continuation = bool(record)
-            record = record or {"thread_id": str(uuid.uuid4()), "effort": effort}
+            record = record or {"thread_id": str(uuid.uuid4()), "effort": effort, **({"scope": scope} if scope else {})}
             pending = {"fingerprint": fingerprint, "snapshot": snapshot, "mode": mode,
                        "input_chars": len(sent), "event_id": str(uuid.uuid4())}
             record["pending"] = pending

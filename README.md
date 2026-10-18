@@ -151,10 +151,24 @@ notion-proxy --profile team
 notion-proxy
 ```
 
-- 每个 profile 单独保存登录信息和会话状态；一个代理进程使用一个 profile，不轮询 workspace。
+- 每个 profile 单独保存登录信息和会话状态。默认一个代理进程只用一个 profile；加 `--failover` 后，额度用完时会自动切换（见下文）。
 - 同一个账号的不同 workspace 要分别检查模型权限。无权使用时会报错，不会自动回退到其他模型。
 - **切换 workspace 后请新建客户端对话。恢复旧对话前，先启动它原来的 profile。** 客户端会把对话历史发给当前连接的 workspace，代理不会跨 workspace 迁移远端聊天，也不会替你自动选择旧空间。
 - 使用相同 profile 续聊、重启或刷新登录，原会话绑定会保留。若 profile 的账号/workspace 发生变化，会使用独立的绑定命名空间。
+
+### 额度用完自动切换 workspace
+
+```sh
+notion-proxy --profile default --failover team,team2
+```
+
+（也可以设置环境变量 `NOTION_GATEWAY_FAILOVER_PROFILES=team,team2`。）
+
+- 当前 workspace 返回 429 或额度用完时，代理会自动换到下一个 profile，同一个客户端对话继续进行，不需要新建。
+- 切换的那一轮会把客户端历史（最多 `NOTION_GATEWAY_MAX_SEND_CHARS`）重放到新 workspace 的新 thread，之后照常只发增量。
+- 只在本轮答案还没交付给客户端时切换，工具调用不会重复执行。
+- 对话切过去后会留在新 workspace；原 workspace 恢复后也不会来回跳。冷却时间优先采用 Notion 返回的 `Retry-After`，否则默认 1800 秒（`NOTION_GATEWAY_EXHAUSTED_COOLDOWN`）。
+- 所有 workspace 都不可用时返回 429。启动时没有 Opus 5.5 权限的备用 profile 会被跳过，可在 `/health` 的 `workspaces` 字段查看每个 profile 的状态。
 
 需要同时开多个 profile 时可给代理不同的 `--port`；对应客户端用 `NOTION_PROXY_PORT` 指向它：
 
