@@ -18,7 +18,8 @@ from .upstream import UpstreamError
 
 MARKER = "CLIENT_CONTEXT_JSON:\n"
 # Bound on what is actually sent per turn (append mode sends only new messages).
-MAX_SEND_CHARS = int(os.getenv("NOTION_GATEWAY_MAX_SEND_CHARS", "400000"))
+MAX_SEND_CHARS = int(os.getenv("NOTION_GATEWAY_MAX_SEND_CHARS", "180000"))
+MAX_TOOL_RESULT_CHARS = int(os.getenv("NOTION_GATEWAY_MAX_TOOL_RESULT_CHARS", "16000"))
 
 
 def digest(value):
@@ -59,19 +60,50 @@ def client_session(headers, body, protocol):
     return digest([protocol, identity, agent, request_class]), source
 
 
+def stable_directive(block):
+    if block.get("type") != "text":
+        return block
+    text = block["text"]
+    if text.startswith("x-anthropic-billing-header:"):
+        return None
+    text = re.sub(r"<total_tokens>\s*\d+ tokens left\s*</total_tokens>", "", text).strip()
+    return {**block, "text": text} if text else None
+
+
 def context_parts(prompt):
     preamble, separator, raw = prompt.partition(MARKER)
     if not separator:
         raise ValueError("Missing bridge context")
     context = json.loads(raw)
+    context["system"] = [v for b in context["system"] if (v := stable_directive(b)) is not None]
     atoms, directives = [], []
     for message in context.pop("messages"):
         if message["role"] == "system":
-            directives.append(message)
+            blocks = [v for b in message["content"] if (v := stable_directive(b)) is not None]
+            if blocks:
+                directives.append({"role": "system", "content": blocks})
         else:
             atoms.extend({"role": message["role"], "content": block} for block in message["content"])
     context["message_system"] = directives
     return preamble, context, atoms
+
+
+def delivered_atoms(result):
+    """Canonical client-visible output, including IDs assigned by this bridge."""
+    if "output" not in result:
+        return [{"role": "assistant", "content": block} for block in result.get("content", [])]
+    atoms = []
+    for item in result["output"]:
+        kind = item["type"]
+        if kind == "message":
+            atoms.extend({"role": "assistant", "content": {"type": "text", "text": b["text"]}}
+                         for b in item["content"])
+        elif kind in {"function_call", "custom_tool_call"}:
+            name = (item.get("namespace", "") + "." if item.get("namespace") else "") + item["name"]
+            args = json.loads(item["arguments"]) if kind == "function_call" else {"input": item["input"]}
+            atoms.append({"role": "assistant", "content": {
+                "type": "tool_use", "id": item["call_id"], "name": name, "input": args}})
+    return atoms
 
 
 def group(atoms):
@@ -88,82 +120,67 @@ def size(value):
     return len(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
 
 
-def clip(atom, limit):
-    """Shorten oversized text inside one atom (e.g. a huge tool result), keeping head and tail."""
-    def cut(block):
-        if block.get("type") == "text" and len(block.get("text", "")) > limit:
-            text, half = block["text"], limit // 2
-            return {**block, "text": text[:half] + f"\n...[{len(text) - limit} chars omitted by bridge]...\n" + text[-half:]}
-        if block.get("type") == "tool_result":
-            return {**block, "content": [cut(b) for b in block.get("content", [])]}
-        return block
-    return {**atom, "content": cut(atom["content"])}
-
-
-def fit_atoms(atoms, budget, allow_drop):
-    """Fit history into budget chars. Returns (atoms, omitted_count); the input list is returned unchanged if it fits."""
-    budget = max(budget, 20000)
-    sizes = [size(a) for a in atoms]
-    if sum(sizes) <= budget:
-        return atoms, 0
-    limit = max(budget // 8, 8000)
-    atoms = [clip(a, limit) if s > limit else a for a, s in zip(atoms, sizes)]
-    sizes = [size(a) for a in atoms]
-    if not allow_drop or sum(sizes) <= budget:
-        return atoms, 0
-    # Only cut at user input with no later tool_result whose tool_use would be dropped.
-    cuts, unmatched = [], set()
-    suffix = [0] * (len(atoms) + 1)
-    for i in range(len(atoms) - 1, -1, -1):
-        suffix[i] = suffix[i + 1] + sizes[i]
-        block = atoms[i]["content"]
-        if block.get("type") == "tool_result":
-            unmatched.add(block.get("tool_use_id"))
-        elif block.get("type") == "tool_use":
-            unmatched.discard(block.get("id"))
-        elif atoms[i]["role"] == "user" and not unmatched:
-            cuts.append(i)
-    cuts.reverse()
-    choice = next((i for i in cuts if suffix[i] <= budget), cuts[-1] if cuts else 0)
-    return atoms[choice:], choice
+def compact_tool_result(atom):
+    block = atom["content"]
+    if block.get("type") != "tool_result":
+        return atom
+    text = "\n".join(b["text"] for b in block["content"])
+    limit = MAX_TOOL_RESULT_CHARS
+    if len(text) <= limit:
+        return atom
+    marker = f"\n[Bridge truncated tool result: {len(text)} original characters; request narrower file ranges or filtered command output for omitted data.]\n"
+    half = max(0, (limit - len(marker)) // 2)
+    shortened = text[:half] + marker + (text[-half:] if half else "")
+    return {**atom, "content": {**block, "content": [{"type": "text", "text": shortened}]}}
 
 
 def incremental_prompt(prompt, record):
     preamble, settings, atoms = context_parts(prompt)
     hashes = [digest(atom) for atom in atoms]
     setting_hashes = {k: digest(v) for k, v in settings.items()}
-    snapshot = {"history": hashes, "settings": setting_hashes}
+    snapshot = {"history": hashes, "settings": setting_hashes,
+                "system_blocks": {k: [digest(b) for b in settings[k]] for k in ("system", "message_system")}}
     fingerprint = digest([settings, atoms])
     previous = record.get("snapshot", {})
     history = previous.get("history", [])
     append = bool(previous) and hashes[:len(history)] == history
     start = len(history) if append else 0
-    messages = group(atoms[start:])
+    # Acknowledged output is already present in Notion. Only relay assigned tool IDs,
+    # not a second copy of its prose, code patches, or tool arguments.
+    acknowledged = previous.get("assistant", [])
+    if append and acknowledged and hashes[start:start + len(acknowledged)] == acknowledged:
+        start += len(acknowledged)
+    else:
+        acknowledged = []
     mode = "initial" if not record else "append" if append else "resync"
-    changes = {k: v for k, v in settings.items()
-               if not append or previous.get("settings", {}).get(k) != setting_hashes[k]}
-    payload = {"mode": mode, **changes, "messages": messages}
-    base = len(json.dumps({**payload, "messages": []}, ensure_ascii=False, separators=(",", ":")))
-    budget = MAX_SEND_CHARS - len(preamble) - base - 4000
+    changes = {}
+    for k, v in settings.items():
+        if not append or previous.get("settings", {}).get(k) != setting_hashes[k]:
+            prior_blocks = previous.get("system_blocks", {}).get(k)
+            if append and prior_blocks is not None and isinstance(v, list):
+                current_blocks = [digest(b) for b in v]
+                if current_blocks[:len(prior_blocks)] == prior_blocks:
+                    changes[k + "_append"] = v[len(prior_blocks):]
+                    continue
+            changes[k] = v
     pending_atoms = atoms[start:]
-    kept, omitted = fit_atoms(pending_atoms, budget, allow_drop=not append)
-    if kept is not pending_atoms:
-        messages = group(kept)
-        payload = {"mode": mode, **changes, "messages": messages}
-        if omitted:
-            payload["omitted_earlier_items"] = omitted
-            payload["omitted_note"] = ("The oldest client history items were omitted to fit the bridge's "
-                                       "size limit; rely on the remaining history and message_system.")
+    kept = [compact_tool_result(atom) for atom in pending_atoms]
+    payload = {"mode": mode, **changes, "messages": group(kept)}
+    unset = sorted(set(previous.get("settings", {})) - set(settings)) if append else []
+    if unset:
+        payload["unset"] = unset
+    if acknowledged and previous.get("tool_ids"):
+        payload["previous_tool_ids"] = previous["tool_ids"]
+    snapshot["truncated_tool_results"] = sum(a != b for a, b in zip(pending_atoms, kept))
     instructions = (
-        "This is a persistent local-client conversation. In append mode, add only the supplied messages "
-        "to the existing client history and keep unchanged context fields. Assistant messages acknowledge "
-        "previously delivered outputs and supply bridge-assigned tool IDs; do not execute them again. "
-        "In initial or resync mode, the supplied client history is authoritative and replaces any old "
-        "client history, including after edits or compaction. message_system contains current client "
-        "system messages. Respond to the latest client request or tool result, using exactly the JSON "
-        "content envelope described above.\n"
+        "Continue the existing client conversation; do not repeat prior actions. Keep unchanged settings. "
+        "Fields ending _append add to the named setting; unset removes settings. previous_tool_ids maps "
+        "your previous tool calls in order to client-assigned IDs. Respond only to new messages, in the "
+        "same JSON content envelope. Resync replaces client history with supplied history.\n"
     )
-    rendered = preamble + instructions + MARKER + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    # The complete protocol description is needed only on initial binding/resync.
+    rendered = (preamble if not append else "") + instructions + MARKER + json.dumps(
+        payload, ensure_ascii=False, separators=(",", ":"))
     return rendered, snapshot, fingerprint, mode
 
 
@@ -241,13 +258,19 @@ class SessionStore:
         if "answer" not in pending:
             text, cursor, sequence, turn_id = await upstream.wait_for_turn(
                 record["thread_id"], record.get("cursor"), record.get("sequence", -1), record.get("turn_id"),
-                on_text=progress)
+                **({"on_text": progress} if progress is not None else {}))
             pending.update(answer=text, cursor=cursor, sequence=sequence, turn_id=turn_id)
             self.save(key, record)
         # Keep raw answers private until schema validation succeeds. Retry the same
         # validation rather than generating a duplicate action if it failed previously.
         result = render(pending["answer"])
-        info = {"thread_id": record["thread_id"], "session_hash": key, "history_mode": pending["mode"],
+        output_atoms = delivered_atoms(result)
+        pending["snapshot"]["assistant"] = [digest(a) for a in output_atoms]
+        pending["snapshot"]["tool_ids"] = [{"id": a["content"]["id"], "name": a["content"]["name"]}
+                                            for a in output_atoms if a["content"]["type"] == "tool_use"]
+        info = {"client_input_chars": len(prompt),
+                "truncated_tool_results": pending["snapshot"].get("truncated_tool_results", 0),
+                "thread_id": record["thread_id"], "session_hash": key, "history_mode": pending["mode"],
                 "upstream_input_chars": pending["input_chars"], "cached": False,
                 "thread_effort": record["effort"]}
         record.update(snapshot=pending["snapshot"], fingerprint=fingerprint, result=result, audit=info,

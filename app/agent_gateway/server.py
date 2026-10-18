@@ -139,7 +139,8 @@ async def messages(request: Request):
     if options["stop_sequences"] or options["schema"] is not None:
         # Side requests (e.g. auto-mode safety classifier) reuse the main session header;
         # keep them out of the main Notion thread so its history is never resynced.
-        session_key, session_source = uuid.uuid4().hex, "side-request"
+        session_key = hashlib.sha256((session_key + json.dumps(options, sort_keys=True)).encode()).hexdigest()
+        session_source = "side-request"
 
     def render(text):
         content, stop = parse_answer(text, tools, choice)
