@@ -25,6 +25,8 @@ MAX_TOOL_RESULT_CHARS = int(os.getenv("NOTION_GATEWAY_MAX_TOOL_RESULT_CHARS", "1
 # chars, continue on a fresh thread seeded with recent history.
 THREAD_MAX_CHARS = int(os.getenv("NOTION_GATEWAY_THREAD_MAX_CHARS", "0"))
 ROLLOVER_SEED_CHARS = int(os.getenv("NOTION_GATEWAY_ROLLOVER_SEED_CHARS", "80000"))
+# Optional tighter bound for stateless side requests (0 = same as MAX_SEND_CHARS).
+SIDE_MAX_SEND_CHARS = int(os.getenv("NOTION_GATEWAY_SIDE_MAX_SEND_CHARS", "0"))
 
 
 def digest(value):
@@ -251,7 +253,7 @@ class SessionStore:
         with self.db:
             self.db.execute("INSERT OR REPLACE INTO sessions VALUES (?, ?)", (self.storage_key(key), json.dumps(record)))
 
-    async def run(self, upstream, key, prompt, effort, render, progress=None):
+    async def run(self, upstream, key, prompt, effort, render, progress=None, stateless=False):
         record = self.get(key)
         sent, snapshot, fingerprint, mode = incremental_prompt(prompt, record)
         fingerprint = digest([fingerprint, effort])
@@ -259,7 +261,14 @@ class SessionStore:
             return record["result"], {**record["audit"], "cached": True}
         pending = record.get("pending")
         superseded = None
-        if pending and pending["fingerprint"] != fingerprint:
+        if stateless and not (pending and pending["fingerprint"] == fingerprint):
+            # Side requests (classifiers, schema calls) rewrite their prompt every time, so
+            # they can never append. Notion re-reads the whole thread per turn: send each one
+            # on a fresh thread instead of resyncing onto an ever-growing one.
+            record = {}
+            sent, snapshot, _, mode = incremental_prompt(prompt, record, SIDE_MAX_SEND_CHARS or None)
+            pending = None
+        elif pending and pending["fingerprint"] != fingerprint:
             # A client may change context after a disconnect, timeout or failed
             # validation. It cannot reproduce the exact old fingerprint reliably.
             # Never append to that uncertain thread or deliver its stale tool calls.

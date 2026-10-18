@@ -48,6 +48,18 @@ class SessionChecks(unittest.IsolatedAsyncioTestCase):
     async def run_turn(self, key="one", messages=None):
         return await self.store.run(self.up, key, prompt(messages or self.first), "medium", json.loads)
 
+    async def test_side_request_uses_fresh_thread_per_request(self):
+        def run(messages):
+            return self.store.run(self.up, "side", prompt(messages), "medium", json.loads, stateless=True)
+        _, first = await run(self.first)
+        _, again = await run(self.first)
+        messages = self.first + [{"role": "assistant", "content": "OK"}, {"role": "user", "content": "Next?"}]
+        _, second = await run(messages)
+        self.assertTrue(again["cached"])
+        self.assertNotEqual(first["thread_id"], second["thread_id"])
+        self.assertEqual([w[1] for w in self.up.writes], [False, False])
+        self.assertIn("Remember violet.", self.up.writes[1][2])
+
     async def test_resume_after_restart_and_new_session_isolation(self):
         _, first = await self.run_turn()
         self.store.close()

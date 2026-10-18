@@ -156,7 +156,7 @@ async def messages(request: Request):
         try:
             async with app.state.lock:
                 result, info = await app.state.sessions.run(app.state.upstream, session_key, prompt, effort, render,
-                                                            progress)
+                                                            progress, stateless=session_source == "side-request")
             result = {**result, "id": message_id}
             audit({"id": message_id, "event": "completed", "model": PUBLIC_MODEL,
                    **info, "session_source": session_source, "duration_s": round(time.monotonic() - started, 2),
