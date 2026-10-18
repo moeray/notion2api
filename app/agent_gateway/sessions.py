@@ -17,7 +17,8 @@ from pathlib import Path
 from .upstream import UpstreamError
 
 MARKER = "CLIENT_CONTEXT_JSON:\n"
-# Bound on what is actually sent per turn (append mode sends only new messages).
+# UTF-8 byte bound on actual serialized content, including JSON escaping. Notion
+# persists multiple copies; a ~200 KB request can exceed its DynamoDB item limit.
 MAX_SEND_CHARS = int(os.getenv("NOTION_GATEWAY_MAX_SEND_CHARS", "180000"))
 MAX_TOOL_RESULT_CHARS = int(os.getenv("NOTION_GATEWAY_MAX_TOOL_RESULT_CHARS", "16000"))
 # Notion re-reads the whole thread every turn, so cost grows with thread length.
@@ -122,8 +123,14 @@ def group(atoms):
     return messages
 
 
+def wire_size(text):
+    # The context is itself JSON embedded inside a Notion JSON string: quotes,
+    # backslashes and newlines are escaped again on the wire.
+    return len(json.dumps(text, ensure_ascii=False).encode("utf-8")) - 2
+
+
 def size(value):
-    return len(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
+    return wire_size(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
 
 
 def compact_tool_result(atom):
@@ -199,7 +206,7 @@ def incremental_prompt(prompt, record, budget=None):
     omitted = 0
     if not append:
         # A full-history send must fit; the oldest turns are the cheapest to lose.
-        overhead = len(preamble) + size({"mode": mode, **changes}) + 2000
+        overhead = wire_size(preamble) + size({"mode": mode, **changes}) + 2000
         kept, omitted = drop_oldest(kept, (budget or MAX_SEND_CHARS) - overhead)
     payload = {"mode": mode, **changes, "messages": group(kept)}
     if omitted:
@@ -298,14 +305,14 @@ class SessionStore:
             sent, snapshot, _, _ = incremental_prompt(prompt, record, ROLLOVER_SEED_CHARS)
             mode = "rollover"
         if not pending:
-            if len(sent) > MAX_SEND_CHARS:
+            if wire_size(sent) > MAX_SEND_CHARS:
                 # Nothing has been saved or dispatched yet, so the existing binding is untouched.
-                raise UpstreamError(f"Turn payload {len(sent)} chars exceeds {MAX_SEND_CHARS}; "
+                raise UpstreamError(f"Turn payload {wire_size(sent)} UTF-8 bytes exceeds {MAX_SEND_CHARS}; "
                                     "compact the conversation", 413, rejected=True)
             continuation = bool(record)
             record = record or {"thread_id": str(uuid.uuid4()), "effort": effort, **({"scope": scope} if scope else {})}
             pending = {"fingerprint": fingerprint, "snapshot": snapshot, "mode": mode,
-                       "input_chars": len(sent), "event_id": str(uuid.uuid4())}
+                       "input_chars": len(sent), "input_bytes": wire_size(sent), "event_id": str(uuid.uuid4())}
             record["pending"] = pending
             # Commit BEFORE dispatch, so a disconnect/restart cannot create a second thread or turn.
             self.save(key, record)
@@ -339,7 +346,8 @@ class SessionStore:
         info = {"client_input_chars": len(prompt),
                 "truncated_tool_results": pending["snapshot"].get("truncated_tool_results", 0),
                 "thread_id": record["thread_id"], "session_hash": key, "history_mode": pending["mode"],
-                "upstream_input_chars": pending["input_chars"], "cached": False,
+                "upstream_input_chars": pending["input_chars"],
+                "upstream_input_bytes": pending.get("input_bytes"), "cached": False,
                 "thread_effort": record["effort"], "thread_chars": record.get("thread_chars", 0)}
         record.update(snapshot=pending["snapshot"], fingerprint=fingerprint, result=result, audit=info,
                       cursor=pending["cursor"], sequence=pending["sequence"], turn_id=pending["turn_id"])

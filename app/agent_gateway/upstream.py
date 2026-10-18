@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import uuid
 from pathlib import Path
 
@@ -25,6 +26,7 @@ class UpstreamError(Exception):
         super().__init__(message)
         self.status = status
         self.rejected = rejected
+        self.diagnostics = {}
         # Workspace quota/rate limit: the gateway may continue the session in another workspace.
         self.exhausted = exhausted
         self.retry_after = retry_after
@@ -141,9 +143,30 @@ class NotionAgent:
         if response.status_code != 200:
             status = response.status_code if response.status_code in {401, 403, 429} else 502
             # Never include arbitrary upstream response bodies, credentials or trace URLs.
-            raise UpstreamError(f"Notion {endpoint} returned HTTP {response.status_code}", status,
-                                rejected=400 <= response.status_code < 500 and response.status_code != 408,
-                                exhausted=quota_signal(response), retry_after=retry_after_seconds(response))
+            error = UpstreamError(f"Notion {endpoint} returned HTTP {response.status_code}", status,
+                                  rejected=400 <= response.status_code < 500 and response.status_code != 408,
+                                  exhausted=quota_signal(response), retry_after=retry_after_seconds(response))
+            try:
+                detail = response.json()
+            except ValueError:
+                detail = {}
+            if not isinstance(detail, dict):
+                detail = {}
+            debug = detail.get("debugMessage", "")
+            # A larger UTF-8 prompt may pass character limits but overflow Notion's
+            # internal duplicated DynamoDB write. Do not expose arbitrary error text.
+            if response.status_code == 400 and isinstance(debug, str) and re.fullmatch(
+                    r"create_session DynamoDB transaction action is \d+ bytes; max is \d+", debug):
+                error.status = 413
+                error.args = ("Notion rejected an oversized UTF-8 context; compact the conversation or split the input",)
+            error.diagnostics = {"upstream_endpoint": endpoint, "upstream_status": response.status_code,
+                                 "request_bytes": len(response.request.content),
+                                 "reasoning_effort": body.get("reasoningEffort")}
+            for field in ("name", "errorId"):
+                value = detail.get(field)
+                if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,80}", value):
+                    error.diagnostics["upstream_" + field] = value
+            raise error
         try:
             return response.json()
         except ValueError:

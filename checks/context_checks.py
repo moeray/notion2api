@@ -32,6 +32,35 @@ class ContextChecks(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn('"role":"assistant"',up.writes[-1][2])
             store.close()
 
+    async def test_utf8_and_json_escaping_budget_keeps_recent_complete_turn(self):
+        from app.agent_gateway.sessions import wire_size
+        for text in ['中文🙂' * 9000, '\\"\n' * 15000]:
+            with self.subTest(kind=text[:4]), tempfile.TemporaryDirectory() as tmp:
+                store=SessionStore(Path(tmp)/'state.db');up=FakeNotion()
+                messages=[{'role':'user','content':'OLD '+text},
+                          {'role':'assistant','content':'acknowledged'},
+                          {'role':'user','content':'Keep this latest instruction.'}]
+                with patch('app.agent_gateway.sessions.MAX_SEND_CHARS',80000):
+                    _, info=await store.run(up,'s',make(messages),'medium',json.loads)
+                sent=up.writes[-1][2]
+                self.assertLessEqual(wire_size(sent),80000)
+                self.assertIn('Keep this latest instruction.',sent)
+                self.assertIn('omitted_earlier_items',sent)
+                self.assertNotIn('OLD ',sent)
+                self.assertEqual(info['upstream_input_bytes'],wire_size(sent))
+                store.close()
+
+    async def test_unicode_single_turn_rejected_before_dispatch(self):
+        from app.agent_gateway.upstream import UpstreamError
+        with tempfile.TemporaryDirectory() as tmp:
+            store=SessionStore(Path(tmp)/'state.db');up=FakeNotion()
+            with patch('app.agent_gateway.sessions.MAX_SEND_CHARS',10000), self.assertRaises(UpstreamError) as ctx:
+                await store.run(up,'s',make([{'role':'user','content':'中'*4000}]),'medium',json.loads)
+            self.assertEqual(ctx.exception.status,413)
+            self.assertEqual(store.get('s'),{})
+            self.assertEqual(up.writes,[])
+            store.close()
+
     def test_volatile_headers_and_token_counters_do_not_resend_system(self):
         def build(n):
             return make([{'role':'user','content':'remember'},

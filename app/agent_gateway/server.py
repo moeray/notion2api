@@ -30,9 +30,12 @@ from .pool import WorkspacePool
 MAX_REQUEST_BYTES = int(os.getenv("NOTION_GATEWAY_MAX_REQUEST_BYTES", "128000000"))
 
 
+def error_type(status):
+    return {401: "authentication_error", 403: "permission_error", 429: "rate_limit_error"}.get(status, "api_error" if status >= 500 else "invalid_request_error")
+
+
 def error_response(message, status=400):
-    error_type = {401: "authentication_error", 403: "permission_error", 429: "rate_limit_error"}.get(status)
-    return JSONResponse({"type": "error", "error": {"type": error_type or ("api_error" if status >= 500 else "invalid_request_error"),
+    return JSONResponse({"type": "error", "error": {"type": error_type(status),
                                                     "message": message}}, status_code=status)
 
 
@@ -182,7 +185,8 @@ async def messages(request: Request):
                    "stop_reason": result["stop_reason"]})
             return result
         except BaseException as exc:
-            audit({"id": message_id, "event": "failed", "error_class": type(exc).__name__})
+            audit({"id": message_id, "event": "failed", "error_class": type(exc).__name__,
+                   **(exc.diagnostics if isinstance(exc, UpstreamError) else {})})
             raise
 
     headers = {"x-notion-usage-estimated": "true", "x-notion-tool-mode": "text-json-bridge"}
@@ -237,7 +241,8 @@ async def messages(request: Request):
                       usage=result["usage"])
             yield sse("message_stop")
         except (UpstreamError, ProtocolError, TimeoutError) as exc:
-            yield sse("error", error={"type": "api_error", "message": str(exc) or "Notion turn timed out"})
+            yield sse("error", error={"type": error_type(getattr(exc, "status", 502)),
+                                      "message": str(exc) or "Notion turn timed out"})
         finally:
             if not task.done():
                 task.cancel()
