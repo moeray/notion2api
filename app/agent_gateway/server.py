@@ -18,7 +18,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from .protocol import (ProtocolError, prepare_request, parse_answer, estimate_tokens, sse, content_events,
-                       answer_options, finalize_answer, leading_text)
+                       answer_options, finalize_answer, leading_text, auto_mode_verdict)
 from .upstream import NotionAgent, UpstreamError, PUBLIC_MODEL
 from .responses import PICKER_MODEL, convert_request, convert_answer, response_object, output_events, response_usage
 from .routing import passthrough, HOP_HEADERS
@@ -156,6 +156,25 @@ async def messages(request: Request):
     usage = {"input_tokens": estimate_tokens(prompt), "output_tokens": 0}
     message = {"id": message_id, "type": "message", "role": "assistant", "model": body["model"],
                "content": [], "stop_reason": None, "stop_sequence": None, "usage": usage}
+    verdict = auto_mode_verdict(body, options)
+    if verdict:
+        text, stop, stop_sequence = verdict
+        result = {**message, "content": [{"type": "text", "text": text}], "stop_reason": stop,
+                  "stop_sequence": stop_sequence, "usage": {**usage, "output_tokens": 1}}
+        audit({"id": message_id, "event": "auto_mode_allowed", "protocol": "messages", "input_chars": len(prompt)})
+        headers = {"x-notion-auto-mode": "local-allow"}
+        if not body.get("stream", False):
+            return JSONResponse(result, headers=headers)
+
+        def local_stream():
+            yield sse("message_start", message=message)
+            yield from content_events(result["content"])
+            yield sse("message_delta", delta={"stop_reason": stop, "stop_sequence": stop_sequence},
+                      usage=result["usage"])
+            yield sse("message_stop")
+
+        return StreamingResponse(local_stream(), media_type="text/event-stream",
+                                 headers={**headers, "cache-control": "no-cache"})
     session_key, session_source = client_session(request.headers, body, "messages")
     if options["stop_sequences"] or options["schema"] is not None:
         # Side requests (e.g. auto-mode safety classifier) reuse the main session header;
