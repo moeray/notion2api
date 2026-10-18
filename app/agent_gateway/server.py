@@ -25,7 +25,8 @@ from .routing import passthrough, HOP_HEADERS
 from .sessions import SessionStore, client_session
 from .config import ROOT, LOCAL, PROFILE, PROFILE_LOCAL, CATALOG
 
-MAX_REQUEST_BYTES = int(os.getenv("NOTION_GATEWAY_MAX_REQUEST_BYTES", "16000000"))
+# Raw body bound only; base64 media is reduced to text markers before the payload is built.
+MAX_REQUEST_BYTES = int(os.getenv("NOTION_GATEWAY_MAX_REQUEST_BYTES", "128000000"))
 
 
 def error_response(message, status=400):

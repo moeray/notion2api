@@ -12,6 +12,19 @@ LOCAL_TOOLS = {"exec_command", "write_stdin", "shell_command", "shell", "apply_p
                "get_goal", "create_goal", "update_goal"}
 
 
+def block_text(block):
+    kind = block.get("type")
+    if kind in {"input_text", "output_text", "text"} and isinstance(block.get("text"), str):
+        return block["text"]
+    if kind in {"input_image", "input_file"}:
+        # The bridge is text-only; base64 media would only bloat history, so keep a short marker.
+        data = block.get("image_url") or block.get("file_data") or ""
+        size = f", ~{len(data) * 3 // 4 // 1024}KB" if isinstance(data, str) and len(data) > 1024 else ""
+        name = f" {block['filename']!r}" if isinstance(block.get("filename"), str) else ""
+        return f"[{kind}{name}{size} omitted: this bridge is text-only]"
+    raise ProtocolError("Unsupported Responses content block: " + str(kind))
+
+
 def convert_request(body):
     if body.get("previous_response_id"):
         raise ProtocolError("Send the complete input history; previous_response_id is not stored")
@@ -65,9 +78,7 @@ def convert_request(body):
             else:
                 content = []
                 for block in raw:
-                    if block.get("type") not in {"input_text", "output_text", "text"}:
-                        raise ProtocolError("Notion Responses currently supports text inputs only")
-                    content.append({"type": "text", "text": block["text"]})
+                    content.append({"type": "text", "text": block_text(block)})
             messages.append({"role": role, "content": content})
         elif kind in {"function_call", "custom_tool_call"}:
             full = f"{item['namespace']}.{item['name']}" if item.get("namespace") else item["name"]
@@ -76,7 +87,9 @@ def convert_request(body):
                                                                   "name": full, "input": args}]})
         elif kind in {"function_call_output", "custom_tool_call_output"}:
             output = item.get("output", "")
-            if not isinstance(output, str):
+            if isinstance(output, list):
+                output = "\n".join(block_text(b) for b in output if isinstance(b, dict))
+            elif not isinstance(output, str):
                 output = json.dumps(output, ensure_ascii=False)
             messages.append({"role": "user", "content": [{"type": "tool_result", "tool_use_id": item["call_id"],
                                                              "content": output}]})

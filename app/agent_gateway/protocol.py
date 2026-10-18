@@ -13,11 +13,29 @@ from .upstream import PUBLIC_MODEL
 
 # Full client context bound; the per-turn upstream payload is bounded separately in sessions.py.
 MAX_INPUT_CHARS = int(os.getenv("NOTION_GATEWAY_MAX_INPUT_CHARS", "4000000"))
+# Client tool descriptions are long usage guides; schemas stay exact and are still validated.
+TOOL_DESC_CHARS = int(os.getenv("NOTION_GATEWAY_TOOL_DESC_CHARS", "1200"))
+
+
+def short_description(text):
+    if not isinstance(text, str) or not TOOL_DESC_CHARS or len(text) <= TOOL_DESC_CHARS:
+        return text
+    return text[:TOOL_DESC_CHARS].rstrip() + " …[description shortened by bridge]"
 ALIASES = {PUBLIC_MODEL, "claude-opus5.5", "notion-opus-5.5", "notion-claude-opus-5-5"}
 
 
 class ProtocolError(Exception):
     pass
+
+
+def media_placeholder(block):
+    source = block.get("source") if isinstance(block.get("source"), dict) else {}
+    kind = block.get("type")
+    media = source.get("media_type") or source.get("type") or "unknown"
+    data = source.get("data")
+    size = f", ~{len(data) * 3 // 4 // 1024}KB" if isinstance(data, str) else ""
+    title = f" {block['title']!r}" if isinstance(block.get("title"), str) else ""
+    return f"[{kind}{title} ({media}{size}) omitted: this bridge is text-only]"
 
 
 def normalize_content(content, role):
@@ -43,6 +61,9 @@ def normalize_content(content, role):
         elif kind in {"thinking", "redacted_thinking"} and role == "assistant":
             # Thinking from another provider cannot be replayed to Notion; drop it.
             continue
+        elif kind in {"image", "document"} and role != "assistant":
+            # The bridge is text-only; base64 media would only bloat history, so keep a short marker.
+            result.append({"type": "text", "text": media_placeholder(block)})
         else:
             raise ProtocolError(f"Unsupported content block {kind!r}; this gateway supports text and local tools only")
     return result
@@ -115,7 +136,8 @@ def prepare_request(body: dict):
             Draft202012Validator.check_schema(tool["input_schema"])
         except SchemaError:
             raise ProtocolError("Invalid tool JSON schema") from None
-        tools[name] = {"name": name, "description": tool.get("description", ""), "input_schema": tool["input_schema"]}
+        tools[name] = {"name": name, "description": short_description(tool.get("description", "")),
+                       "input_schema": tool["input_schema"]}
     messages = []
     pending = set()
     for msg in body.get("messages", []):

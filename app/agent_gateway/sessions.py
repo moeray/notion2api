@@ -20,6 +20,11 @@ MARKER = "CLIENT_CONTEXT_JSON:\n"
 # Bound on what is actually sent per turn (append mode sends only new messages).
 MAX_SEND_CHARS = int(os.getenv("NOTION_GATEWAY_MAX_SEND_CHARS", "180000"))
 MAX_TOOL_RESULT_CHARS = int(os.getenv("NOTION_GATEWAY_MAX_TOOL_RESULT_CHARS", "16000"))
+# Notion re-reads the whole thread every turn, so cost grows with thread length.
+# Optional (0 = off; Notion manages its own thread context): past this many accumulated
+# chars, continue on a fresh thread seeded with recent history.
+THREAD_MAX_CHARS = int(os.getenv("NOTION_GATEWAY_THREAD_MAX_CHARS", "0"))
+ROLLOVER_SEED_CHARS = int(os.getenv("NOTION_GATEWAY_ROLLOVER_SEED_CHARS", "80000"))
 
 
 def digest(value):
@@ -133,7 +138,31 @@ def compact_tool_result(atom):
     return {**atom, "content": {**block, "content": [{"type": "text", "text": shortened}]}}
 
 
-def incremental_prompt(prompt, record):
+def drop_oldest(atoms, limit):
+    """Drop the oldest history to fit limit, cutting only at user input so tool pairs stay intact."""
+    sizes = [size(a) for a in atoms]
+    if sum(sizes) <= limit:
+        return atoms, 0
+    best, latest, total, unmatched = None, None, 0, set()
+    for i in range(len(atoms) - 1, 0, -1):
+        total += sizes[i]
+        if total > limit and latest is not None:
+            break
+        block = atoms[i]["content"]
+        if block.get("type") == "tool_result":
+            unmatched.add(block.get("tool_use_id"))
+        elif block.get("type") == "tool_use":
+            unmatched.discard(block.get("id"))
+        elif atoms[i]["role"] == "user" and not unmatched:
+            latest = latest or i
+            if total <= limit:
+                best = i
+    # If even the newest turn exceeds the limit, keep just that turn.
+    best = best or latest
+    return (atoms[best:], best) if best else (atoms, 0)
+
+
+def incremental_prompt(prompt, record, budget=None):
     preamble, settings, atoms = context_parts(prompt)
     hashes = [digest(atom) for atom in atoms]
     setting_hashes = {k: digest(v) for k, v in settings.items()}
@@ -164,13 +193,23 @@ def incremental_prompt(prompt, record):
             changes[k] = v
     pending_atoms = atoms[start:]
     kept = [compact_tool_result(atom) for atom in pending_atoms]
+    truncated = sum(a != b for a, b in zip(pending_atoms, kept))
+    omitted = 0
+    if not append:
+        # A full-history send must fit; the oldest turns are the cheapest to lose.
+        overhead = len(preamble) + size({"mode": mode, **changes}) + 2000
+        kept, omitted = drop_oldest(kept, (budget or MAX_SEND_CHARS) - overhead)
     payload = {"mode": mode, **changes, "messages": group(kept)}
+    if omitted:
+        payload["omitted_earlier_items"] = omitted
+        payload["omitted_note"] = ("The oldest client history was omitted by the bridge to bound context; "
+                                   "rely on the remaining history and re-read files if details are needed.")
     unset = sorted(set(previous.get("settings", {})) - set(settings)) if previous else []
     if unset:
         payload["unset"] = unset
     if acknowledged and previous.get("tool_ids"):
         payload["previous_tool_ids"] = previous["tool_ids"]
-    snapshot["truncated_tool_results"] = sum(a != b for a, b in zip(pending_atoms, kept))
+    snapshot["truncated_tool_results"] = truncated
     instructions = (
         "Continue the existing client conversation; do not repeat prior actions. Keep unchanged settings. "
         "Fields ending _append add to the named setting; unset removes settings. previous_tool_ids maps "
@@ -229,6 +268,13 @@ class SessionStore:
             record = {}
             sent, snapshot, _, mode = incremental_prompt(prompt, record)
             pending = None
+        if not pending and THREAD_MAX_CHARS and record and mode == "append" and \
+                record.get("thread_chars", 0) + len(sent) > THREAD_MAX_CHARS:
+            # Restore the old binding if the fresh thread is rejected.
+            superseded = record
+            record = {}
+            sent, snapshot, _, _ = incremental_prompt(prompt, record, ROLLOVER_SEED_CHARS)
+            mode = "rollover"
         if not pending:
             if len(sent) > MAX_SEND_CHARS:
                 # Nothing has been saved or dispatched yet, so the existing binding is untouched.
@@ -259,6 +305,7 @@ class SessionStore:
                 record["thread_id"], record.get("cursor"), record.get("sequence", -1), record.get("turn_id"),
                 **({"on_text": progress} if progress is not None else {}))
             pending.update(answer=text, cursor=cursor, sequence=sequence, turn_id=turn_id)
+            record["thread_chars"] = record.get("thread_chars", 0) + pending["input_chars"] + len(text)
             self.save(key, record)
         # Keep raw answers private until schema validation succeeds. Retry the same
         # validation rather than generating a duplicate action if it failed previously.
@@ -271,7 +318,7 @@ class SessionStore:
                 "truncated_tool_results": pending["snapshot"].get("truncated_tool_results", 0),
                 "thread_id": record["thread_id"], "session_hash": key, "history_mode": pending["mode"],
                 "upstream_input_chars": pending["input_chars"], "cached": False,
-                "thread_effort": record["effort"]}
+                "thread_effort": record["effort"], "thread_chars": record.get("thread_chars", 0)}
         record.update(snapshot=pending["snapshot"], fingerprint=fingerprint, result=result, audit=info,
                       cursor=pending["cursor"], sequence=pending["sequence"], turn_id=pending["turn_id"])
         record.pop("pending")

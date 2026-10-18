@@ -110,3 +110,38 @@ class ContextChecks(unittest.IsolatedAsyncioTestCase):
             system='x-anthropic-billing-header: tracking\nNever modify protected files.'),{})
         self.assertIn('Never modify protected files.',sent)
         self.assertNotIn('x-anthropic-billing-header',sent)
+
+
+class BudgetChecks(unittest.IsolatedAsyncioTestCase):
+    def test_oversized_resync_drops_oldest_turns_keeping_tool_pairs(self):
+        tools=[{'name':'Read','input_schema':{'type':'object'}}]
+        messages=[]
+        for i in range(30):
+            messages += [{'role':'user','content':f'q{i} '+'x'*3000},
+                         {'role':'assistant','content':[{'type':'tool_use','id':f't{i}','name':'Read','input':{}}]},
+                         {'role':'user','content':[{'type':'tool_result','tool_use_id':f't{i}','content':'y'*3000}]}]
+        with patch('app.agent_gateway.sessions.MAX_SEND_CHARS',40000):
+            sent,snap,_,mode=incremental_prompt(make(messages,tools=tools),{})
+        payload=json.loads(sent.split(MARKER)[1])
+        self.assertLess(len(sent),40000)
+        self.assertGreater(payload['omitted_earlier_items'],0)
+        first=payload['messages'][0]
+        self.assertEqual(first['role'],'user');self.assertEqual(first['content'][0]['type'],'text')
+        self.assertIn('q29',sent);self.assertNotIn('q0 ',sent)
+        self.assertEqual(len(snap['history']),90)
+
+    async def test_long_thread_rolls_over_to_fresh_trimmed_thread(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store=SessionStore(Path(tmp)/'state.db');up=FakeNotion()
+            history=[{'role':'user','content':'old '+'o'*30000}]
+            with patch('app.agent_gateway.sessions.THREAD_MAX_CHARS',50000), \
+                 patch('app.agent_gateway.sessions.ROLLOVER_SEED_CHARS',20000):
+                result,first=await store.run(up,'s',make(history),'medium',json.loads)
+                history += [{'role':'assistant','content':result['content']},
+                            {'role':'user','content':'next '+'n'*25000}]
+                _,second=await store.run(up,'s',make(history),'medium',json.loads)
+            self.assertNotEqual(first['thread_id'],second['thread_id'])
+            self.assertEqual(second['history_mode'],'rollover')
+            self.assertNotIn('o'*1000,up.writes[-1][2])
+            self.assertIn('n'*1000,up.writes[-1][2])
+            store.close()

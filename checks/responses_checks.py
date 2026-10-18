@@ -26,10 +26,16 @@ class ResponsesChecks(unittest.TestCase):
         self.assertEqual(output[0]["type"], "custom_tool_call")
         self.assertIn("*** Begin Patch", output[0]["input"])
 
-    def test_unsupported_state_and_images_rejected(self):
-        for body in [{"input": "x", "previous_response_id": "old"}, {"input": [{"role": "user", "content": [{"type": "input_image"}]}]}]:
-            with self.assertRaises(ProtocolError):
-                convert_request(body)
+    def test_unsupported_state_rejected(self):
+        with self.assertRaises(ProtocolError):
+            convert_request({"input": "x", "previous_response_id": "old"})
+
+    def test_images_reduced_to_text_markers(self):
+        data = "data:image/png;base64," + "A" * 200_000
+        prompt = convert_request({"input": [{"role": "user", "content": [{"type": "input_image", "image_url": data}]}]})[0]
+        self.assertIn("input_image", prompt)
+        self.assertIn("omitted", prompt)
+        self.assertNotIn("AAAA", prompt)
 
     def test_external_plugin_tools_are_not_exposed_on_notion_model(self):
         prompt, tools, _, _, mapping = convert_request({"input": "Fix a file", "tools": [
