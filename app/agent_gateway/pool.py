@@ -12,8 +12,6 @@ import time
 from .upstream import UpstreamError
 
 COOLDOWN = float(os.getenv("NOTION_GATEWAY_EXHAUSTED_COOLDOWN", "1800"))
-# Seconds a workspace may stay silent after accepting a turn before the next one is tried.
-STALL_TIMEOUT = float(os.getenv("NOTION_GATEWAY_STALL_TIMEOUT", "10"))
 
 
 class WorkspacePool:
@@ -43,12 +41,11 @@ class WorkspacePool:
     async def run(self, sessions, key, *args, **kwargs):
         preferred = sessions.get(key).get("scope") or sessions.namespace or None
         candidates = self.order(preferred)
-        for index, (name, upstream) in enumerate(candidates):
-            # The last candidate gets the normal timeout: a slow answer beats no answer.
-            stall = STALL_TIMEOUT if STALL_TIMEOUT > 0 and index < len(candidates) - 1 else None
+        for name, upstream in candidates:
             try:
-                result, info = await sessions.run(upstream, key, *args, **kwargs, stall_timeout=stall)
+                result, info = await sessions.run(upstream, key, *args, **kwargs)
             except UpstreamError as exc:
+                # Silence and timeouts do not establish quota exhaustion.
                 if not exc.exhausted:
                     raise
                 self.cooling[name] = time.time() + (exc.retry_after or COOLDOWN)

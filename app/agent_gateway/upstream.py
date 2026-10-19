@@ -20,9 +20,6 @@ SESSION_HEADERS = {"user-agent", "notion-client-version", "notion-audit-log-plat
 QUOTA_MARKERS = ("rate limit", "ratelimit", "rate_limit", "quota", "credit", "usage limit", "exhausted")
 
 
-STALL_COOLDOWN = float(os.getenv("NOTION_GATEWAY_STALL_COOLDOWN", "600"))
-
-
 class UpstreamError(Exception):
     def __init__(self, message: str, status: int = 502, rejected: bool = False, exhausted: bool = False,
                  retry_after: float | None = None):
@@ -211,11 +208,10 @@ class NotionAgent:
                 "browserEnabled": False, "clientMessageId": event_id,
             })
 
-    async def wait_for_turn(self, thread_id, cursor=None, after_sequence=-1, previous_turn_id=None, on_text=None,
-                            stall_timeout=None):
+    async def wait_for_turn(self, thread_id, cursor=None, after_sequence=-1, previous_turn_id=None, on_text=None):
         async with asyncio.timeout(self.timeout):
             loop = asyncio.get_running_loop()
-            started = progressed = loop.time()
+            progressed = loop.time()
             state = Transcript(after_sequence, previous_turn_id)
             state.cursor = cursor
             seen = ""
@@ -244,11 +240,6 @@ class NotionAgent:
                     marker, progressed = current, loop.time()
                 elif state.active and self.idle_timeout > 0 and loop.time() - progressed > self.idle_timeout:
                     raise UpstreamError(f"Notion turn made no progress for {self.idle_timeout:g}s", 504)
-                if stall_timeout and not state.active and loop.time() - started > stall_timeout:
-                    # A workspace without quota may accept the turn and then never start it.
-                    # Nothing was produced, so the caller may safely continue elsewhere.
-                    raise UpstreamError(f"Notion workspace did not start the turn within {stall_timeout:g}s", 504,
-                                        exhausted=True, retry_after=STALL_COOLDOWN)
                 await asyncio.sleep(0.75 if on_text else 1.5)
 
     async def complete(self, prompt: str, effort: str = "medium"):

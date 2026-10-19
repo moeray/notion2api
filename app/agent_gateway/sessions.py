@@ -315,7 +315,7 @@ class SessionStore:
         with self.db:
             self.db.execute("INSERT OR REPLACE INTO sessions VALUES (?, ?)", (self.storage_key(key), json.dumps(record)))
 
-    async def run(self, upstream, key, prompt, effort, render, progress=None, stateless=False, stall_timeout=None):
+    async def run(self, upstream, key, prompt, effort, render, progress=None, stateless=False):
         record = self.get(key)
         sent, snapshot, fingerprint, mode = incremental_prompt(prompt, record)
         fingerprint = digest([fingerprint, effort])
@@ -387,8 +387,7 @@ class SessionStore:
         if "answer" not in pending:
             text, cursor, sequence, turn_id = await upstream.wait_for_turn(
                 record["thread_id"], record.get("cursor"), record.get("sequence", -1), record.get("turn_id"),
-                **({"on_text": progress} if progress is not None else {}),
-                **({"stall_timeout": stall_timeout} if stall_timeout else {}))
+                **({"on_text": progress} if progress is not None else {}))
             pending.update(answer=text, cursor=cursor, sequence=sequence, turn_id=turn_id)
             record["thread_chars"] = record.get("thread_chars", 0) + pending["input_chars"] + len(text)
             self.save(key, record)

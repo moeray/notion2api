@@ -171,7 +171,7 @@ notion-proxy --profile default --failover team,team2
 
 - 当前 workspace 返回 429 或额度用完时，代理会自动换到下一个 profile，同一个客户端对话继续进行，不需要新建。
 - 切换的那一轮只把最近一段客户端历史（默认 60000 字符，`NOTION_GATEWAY_FAILOVER_SEED_CHARS`）带到新 workspace 的新 thread，之后照常只发增量。
-- 某个 workspace 接了请求但 10 秒内没有任何响应（常见于没额度），会直接换下一个，并冷却 600 秒（`NOTION_GATEWAY_STALL_TIMEOUT` / `NOTION_GATEWAY_STALL_COOLDOWN`）。最后一个候选不做这个判断。
+- 请求启动慢、无进展或超时不会触发 workspace 切换，也不会将 workspace 标记为额度耗尽；只有收到明确的额度耗尽或限流信号才切换。原有总超时和空闲超时仍然生效，同一请求重试时继续轮询原会话。
 - 只在本轮答案还没交付给客户端时切换，工具调用不会重复执行。
 - 对话切过去后会留在新 workspace；原 workspace 恢复后也不会来回跳。冷却时间优先采用 Notion 返回的 `Retry-After`，否则默认 1800 秒（`NOTION_GATEWAY_EXHAUSTED_COOLDOWN`）。
 - 所有 workspace 都不可用时返回 429。启动时没有 Opus 5.5 权限的备用 profile 会被跳过，可在 `/health` 的 `workspaces` 字段查看每个 profile 的状态。

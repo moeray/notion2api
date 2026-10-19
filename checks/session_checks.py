@@ -39,18 +39,16 @@ class ScopedNotion(FakeNotion):
         super().__init__()
         self.account_scope = scope
         self.exhausted = False
+        self.wait_error = None
 
     async def start_turn(self, text, effort, thread, event, continuation):
         if self.exhausted:
             raise UpstreamError("quota", 429, rejected=True, exhausted=True)
         await super().start_turn(text, effort, thread, event, continuation)
 
-    async def wait_for_turn(self, thread, cursor, sequence, turn_id, stall_timeout=None):
-        self.stall_timeouts = getattr(self, "stall_timeouts", []) + [stall_timeout]
-        if getattr(self, "stalled", False):
-            if stall_timeout:
-                raise UpstreamError("stalled", 504, exhausted=True)
-            raise TimeoutError()
+    async def wait_for_turn(self, thread, cursor, sequence, turn_id):
+        if self.wait_error is not None:
+            raise self.wait_error
         return await super().wait_for_turn(thread, cursor, sequence, turn_id)
 
 
@@ -104,17 +102,36 @@ class SessionChecks(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(third["thread_id"], second["thread_id"])
         self.assertEqual(b.writes[-1][1], True)
 
-    async def test_silent_workspace_fails_over_quickly(self):
-        a, b = ScopedNotion("a"), ScopedNotion("b")
-        a.stalled = True
-        pool = WorkspacePool([("a", a), ("b", b)])
-        _, info = await pool.run(self.store, "one", prompt(self.first), "medium", json.loads)
-        self.assertEqual(info["profile"], "b")
-        self.assertEqual(info["history_mode"], "failover")
-        self.assertIn("a", pool.cooling)
-        # Only non-final candidates get the short stall bound.
-        self.assertTrue(a.stall_timeouts[0])
-        self.assertIsNone(b.stall_timeouts[0])
+    async def test_no_progress_keeps_workspace_and_retry_polls_same_turn(self):
+        for error in (TimeoutError(), UpstreamError("Notion turn made no progress", 504)):
+            with self.subTest(error=type(error).__name__):
+                a, b = ScopedNotion("a"), ScopedNotion("b")
+                pool = WorkspacePool([("a", a), ("b", b)])
+                key = type(error).__name__
+
+                def run(messages):
+                    return pool.run(self.store, key, prompt(messages), "medium", json.loads)
+
+                _, first = await run(self.first)
+                messages = self.first + [{"role": "assistant", "content": "OK"},
+                                         {"role": "user", "content": "What color?"}]
+                a.wait_error = error
+                with self.assertRaises(type(error)):
+                    await run(messages)
+                pending = self.store.get(key)
+                self.assertEqual(pending["scope"], "a")
+                self.assertEqual(pending["thread_id"], first["thread_id"])
+                self.assertIn("pending", pending)
+                self.assertEqual(pool.cooling, {})
+                self.assertEqual(b.writes, [])
+
+                a.wait_error = None
+                _, retried = await run(messages)
+                self.assertEqual(retried["profile"], "a")
+                self.assertEqual(retried["thread_id"], first["thread_id"])
+                self.assertEqual(retried["history_mode"], "append")
+                self.assertEqual(len(a.writes), 2)
+                self.assertEqual(b.writes, [])
 
     def test_transcript_activity_ignores_own_message_and_quota_banner(self):
         state = Transcript(5)
