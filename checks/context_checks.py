@@ -142,6 +142,39 @@ class ContextChecks(unittest.IsolatedAsyncioTestCase):
 
 
 class BudgetChecks(unittest.IsolatedAsyncioTestCase):
+    def test_resync_preserves_history_beyond_fresh_thread_seed_cap(self):
+        initial = make([{'role':'user','content':'Earlier decision: violet.'}])
+        _, snapshot, _, _ = incremental_prompt(initial, {})
+        changed = make([{'role':'user','content':'Earlier decision: violet. '+ 'x'*70000},
+                        {'role':'assistant','content':'Understood.'},
+                        {'role':'user','content':'What was the decision?'}])
+        with patch('app.agent_gateway.sessions.NEW_THREAD_MAX_CHARS', 60000):
+            sent, state, _, mode = incremental_prompt(changed, {'snapshot':snapshot})
+        self.assertEqual(mode, 'resync')
+        self.assertIn('Earlier decision: violet.', sent)
+        self.assertEqual(state['omitted_earlier_items'], 0)
+        self.assertNotIn('Bridge omitted', sent)
+        self.assertIn('retain relevant earlier context', sent)
+
+    async def test_300k_seed_still_respects_hard_wire_budget(self):
+        from app.agent_gateway.sessions import wire_size
+        from app.agent_gateway.upstream import UpstreamError
+        with tempfile.TemporaryDirectory() as tmp:
+            store=SessionStore(Path(tmp)/'state.db'); up=FakeNotion()
+            with patch('app.agent_gateway.sessions.NEW_THREAD_MAX_CHARS', 300000), \
+                    patch('app.agent_gateway.sessions.MAX_SEND_CHARS', 180000):
+                messages=[{'role':'user','content':f'Turn {i}: '+ 'x'*20000} for i in range(15)]
+                await store.run(up,'s',make(messages),'medium',json.loads)
+                self.assertLessEqual(wire_size(up.writes[-1][2]), 180000)
+                self.assertIn('Turn 14:',up.writes[-1][2])
+                before=len(up.writes)
+                with self.assertRaises(UpstreamError) as ctx:
+                    await store.run(up,'oversized',make([{'role':'user','content':'x'*240000}]),
+                                    'medium',json.loads)
+                self.assertEqual(ctx.exception.status,413)
+                self.assertEqual(len(up.writes),before)
+            store.close()
+
     def test_oversized_resync_drops_oldest_turns_keeping_tool_pairs(self):
         tools=[{'name':'Read','input_schema':{'type':'object'}}]
         messages=[]

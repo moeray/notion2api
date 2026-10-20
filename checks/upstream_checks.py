@@ -7,6 +7,25 @@ from app.agent_gateway.upstream import NotionAgent, UpstreamError
 
 
 class UpstreamChecks(unittest.IsolatedAsyncioTestCase):
+    async def test_terminal_failure_exposes_cursor_for_same_thread_recovery(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            session = Path(tmp) / 'session.json'
+            session.write_text(json.dumps({'origin':'https://app.notion.com','space_id':'s',
+                                           'user_id':'u','cookies':[]}))
+            agent = NotionAgent(session)
+            await agent.client.aclose()
+            agent.client = httpx.AsyncClient(base_url='https://app.notion.com',
+                transport=httpx.MockTransport(lambda request: httpx.Response(200, json={
+                    'forward_cursor':'done-cursor','forward_after_sequence':20,
+                    'patches':[{'op':'put','entity':{'kind':'turn_completed','id':'done',
+                        'sequence':20,'turn_id':'failed-turn','stop_reason':'max_tokens'}}]})))
+            with self.assertRaises(UpstreamError) as ctx:
+                await agent.wait_for_turn('thread', after_sequence=10, previous_turn_id='prior')
+            self.assertEqual(ctx.exception.completed_turn,
+                             {'cursor':'done-cursor','sequence':20,'turn_id':'failed-turn'})
+            self.assertFalse(ctx.exception.exhausted)
+            await agent.close()
+
     async def test_dynamodb_size_error_is_413_with_safe_diagnostics(self):
         with tempfile.TemporaryDirectory() as tmp:
             session = Path(tmp) / 'session.json'

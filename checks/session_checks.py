@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 
 from app.agent_gateway.protocol import prepare_request
-from app.agent_gateway.sessions import SessionStore, client_session, incremental_prompt
+from app.agent_gateway.sessions import SessionStore, client_session, incremental_prompt, is_away_summary
 from app.agent_gateway.upstream import Transcript, UpstreamError
 from app.agent_gateway.pool import WorkspacePool
 
@@ -143,12 +143,14 @@ class SessionChecks(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(state.active)
 
     async def test_new_thread_input_is_capped(self):
-        from app.agent_gateway.sessions import NEW_THREAD_MAX_CHARS, wire_size
+        from app.agent_gateway.sessions import wire_size
+        from unittest.mock import patch
         notion = FakeNotion()
         huge = [{"role": "user", "content": "START-MARK " + "x" * 300000 + " END-MARK"}]
-        await self.store.run(notion, "big", prompt(huge), "medium", json.loads, stateless=True)
+        with patch("app.agent_gateway.sessions.NEW_THREAD_MAX_CHARS", 60000):
+            await self.store.run(notion, "big", prompt(huge), "medium", json.loads, stateless=True)
         sent = notion.writes[0][2]
-        self.assertLessEqual(wire_size(sent), NEW_THREAD_MAX_CHARS + 2000)
+        self.assertLessEqual(wire_size(sent), 62000)
         self.assertIn("START-MARK", sent)
         self.assertIn("END-MARK", sent)
         self.assertIn("Bridge omitted", sent)
@@ -195,7 +197,7 @@ class SessionChecks(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.up.writes), 1)
         self.assertEqual(len(self.up.polls), 2)
 
-    async def test_pending_different_request_recovers_on_isolated_thread(self):
+    async def test_pending_different_request_drains_and_continues_same_thread(self):
         self.up.timeout = True
         with self.assertRaises(TimeoutError):
             await self.run_turn()
@@ -205,12 +207,14 @@ class SessionChecks(unittest.IsolatedAsyncioTestCase):
         self.up.timeout = False
         messages = self.first + [{"role": "user", "content": "different"}]
         _, info = await self.run_turn(messages=messages)
-        self.assertNotEqual(info["thread_id"], old_thread)
-        self.assertEqual(info["history_mode"], "initial")
-        self.assertFalse(self.up.writes[-1][1])
-        self.assertIn("Remember violet", self.up.writes[-1][2])
+        self.assertEqual(info["thread_id"], old_thread)
+        self.assertEqual(info["history_mode"], "append")
+        self.assertTrue(info["recovered_pending"])
+        self.assertTrue(self.up.writes[-1][1])
+        self.assertNotIn("Remember violet", self.up.writes[-1][2])
         self.assertIn("different", self.up.writes[-1][2])
-        self.assertEqual(self.up.polls[-1][1:], (None, -1, None))
+        self.assertIn('"previous_response_not_delivered":true', self.up.writes[-1][2])
+        self.assertEqual(self.up.polls[-1][1:], ("cursor1", 10, "turn1"))
         await self.run_turn(messages=messages)
         self.assertEqual(len(self.up.writes), 2)
 
@@ -223,34 +227,130 @@ class SessionChecks(unittest.IsolatedAsyncioTestCase):
         self.assertIn("answer", old["pending"])
         _, info = await self.store.run(self.up, "one", prompt(self.first, system="Updated context"),
                                        "medium", json.loads)
-        self.assertNotEqual(info["thread_id"], old["thread_id"])
+        self.assertEqual(info["thread_id"], old["thread_id"])
         self.assertEqual(len(self.up.writes), 2)
+        self.assertEqual(len(self.up.polls), 2)
 
-    async def test_rejected_recovery_preserves_original_pending_request(self):
+    async def test_rejected_recovery_preserves_completed_cursor_on_same_thread(self):
         self.up.timeout = True
         with self.assertRaises(TimeoutError):
             await self.run_turn()
         original = self.store.get("one")
+        self.up.timeout = False
         self.up.reject = True
+        messages = self.first + [{"role": "user", "content": "different"}]
         with self.assertRaises(UpstreamError):
-            await self.run_turn(messages=[{"role": "user", "content": "different"}])
-        self.assertEqual(self.store.get("one"), original)
-        self.up.reject = self.up.timeout = False
-        await self.run_turn()
-        self.assertEqual(len(self.up.writes), 1)
+            await self.run_turn(messages=messages)
+        checkpoint = self.store.get("one")
+        self.assertEqual(checkpoint["thread_id"], original["thread_id"])
+        self.assertNotIn("pending", checkpoint)
+        self.assertEqual(checkpoint["sequence"], 10)
+        self.assertTrue(checkpoint["discarded_turn"])
+        self.up.reject = False
+        _, info = await self.run_turn(messages=messages)
+        self.assertEqual(info["thread_id"], original["thread_id"])
+        self.assertEqual(len(self.up.writes), 2)
 
-    async def test_interrupted_recovery_resumes_new_thread_without_duplicate(self):
+    async def test_changed_request_during_unfinished_turn_keeps_binding_without_new_send(self):
         self.up.timeout = True
         with self.assertRaises(TimeoutError):
             await self.run_turn()
         messages = [{"role": "user", "content": "different"}]
+        original = self.store.get("one")
         with self.assertRaises(TimeoutError):
             await self.run_turn(messages=messages)
-        new_thread = self.up.writes[-1][0]
+        self.assertEqual(self.store.get("one"), original)
+        self.assertEqual(len(self.up.writes), 1)
         self.up.timeout = False
         _, info = await self.run_turn(messages=messages)
-        self.assertEqual(info["thread_id"], new_thread)
+        self.assertEqual(info["thread_id"], original["thread_id"])
         self.assertEqual(len(self.up.writes), 2)
+
+    async def test_background_recap_keeps_main_snapshot_and_uses_same_thread_after_restart(self):
+        result, first = await self.run_turn()
+        main = self.first + [{"role": "assistant", "content": result["content"]}]
+        recap = main + [{"role": "user", "content":
+            "The user stepped away and is coming back. Recap in under 40 words, "
+            "1-2 plain sentences, no markdown. Lead with the overall goal and current task."}]
+        self.assertTrue(is_away_summary({"messages": recap}))
+        self.assertTrue(is_away_summary({"messages": recap + [
+            {"role": "system", "content": "<total_tokens>123 tokens left</total_tokens>"}]}))
+        self.assertFalse(is_away_summary({"messages": recap + [{"role": "user", "content": "continue"}]}))
+        original = self.store.get("one")["snapshot"]
+        _, summary = await self.store.run(self.up, "one", prompt(recap), "medium", json.loads,
+                                          preserve_history=True)
+        self.assertEqual(first["thread_id"], summary["thread_id"])
+        self.assertEqual(self.store.get("one")["snapshot"], original)
+        self.store.close()
+        self.store = SessionStore(self.path)
+        _, cached = await self.store.run(self.up, "one", prompt(recap), "medium", json.loads,
+                                         preserve_history=True)
+        self.assertTrue(cached["cached"])
+        self.assertEqual(len(self.up.writes), 2)
+        _, followup = await self.run_turn(messages=main + [{"role": "user", "content": "What color?"}])
+        self.assertEqual(followup["thread_id"], first["thread_id"])
+        self.assertEqual(followup["history_mode"], "append")
+        self.assertNotIn("Remember violet", self.up.writes[-1][2])
+        self.assertNotIn("Recap in under", self.up.writes[-1][2])
+        self.assertEqual([w[1] for w in self.up.writes], [False, True, True])
+
+    async def test_interrupted_recap_does_not_replace_main_snapshot_or_deliver_stale_tools(self):
+        result, first = await self.run_turn()
+        main = self.first + [{"role": "assistant", "content": result["content"]}]
+        self.up.timeout = True
+        with self.assertRaises(TimeoutError):
+            await self.store.run(self.up, "one",
+                                 prompt(main + [{"role": "user", "content": "recap"}], max_tokens=64),
+                                 "medium", json.loads, preserve_history=True)
+        self.up.timeout = False
+        rendered = []
+        def render(text):
+            rendered.append(text)
+            return json.loads(text)
+        _, next_turn = await self.store.run(self.up, "one",
+            prompt(main + [{"role": "user", "content": "What color?"}]), "medium", render)
+        self.assertEqual(next_turn["thread_id"], first["thread_id"])
+        self.assertEqual(next_turn["history_mode"], "append")
+        self.assertEqual(len(rendered), 1)
+        self.assertNotIn("Remember violet", self.up.writes[-1][2])
+        self.assertEqual(self.up.polls[-1][2], 20)
+        self.assertIn('"max_output_tokens":1000', self.up.writes[-1][2])
+
+    async def test_main_restores_settings_changed_by_background_recap(self):
+        result, _ = await self.run_turn()
+        main = self.first + [{"role": "assistant", "content": result["content"]}]
+        await self.store.run(self.up, "one",
+            prompt(main + [{"role": "user", "content": "recap"}],
+                   max_tokens=64, tool_choice={"type": "none"}),
+            "medium", json.loads, preserve_history=True)
+        await self.run_turn(messages=main + [{"role": "user", "content": "continue"}])
+        payload = json.loads(self.up.writes[-1][2].split("CLIENT_CONTEXT_JSON:\n", 1)[1])
+        self.assertEqual(payload["max_output_tokens"], 1000)
+        self.assertEqual(payload["tool_choice"], {"type": "auto"})
+        self.assertEqual(payload["mode"], "append")
+
+    async def test_failed_terminal_turn_can_recover_but_unknown_failure_cannot(self):
+        up = ScopedNotion("a")
+        up.wait_error = UpstreamError("still pending", 504)
+        with self.assertRaises(UpstreamError):
+            await self.store.run(up, "one", prompt(self.first), "medium", json.loads)
+        original = self.store.get("one")
+        messages = self.first + [{"role": "user", "content": "continue"}]
+        with self.assertRaises(UpstreamError):
+            await self.store.run(up, "one", prompt(messages), "medium", json.loads)
+        self.assertEqual(self.store.get("one"), original)
+        error = UpstreamError("terminal failure")
+        error.completed_turn = {"cursor": "failed-cursor", "sequence": 20, "turn_id": "failed"}
+        original_wait = up.wait_for_turn
+        async def complete_once(*args):
+            if up.wait_error:
+                up.wait_error = None
+                raise error
+            return await original_wait(*args)
+        up.wait_for_turn = complete_once
+        _, info = await self.store.run(up, "one", prompt(messages), "medium", json.loads)
+        self.assertEqual(info["thread_id"], original["thread_id"])
+        self.assertEqual(up.polls[-1][1:], ("failed-cursor", 20, "failed"))
 
     async def test_definitive_rejection_does_not_leave_pending_binding(self):
         self.up.reject = True

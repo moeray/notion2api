@@ -159,7 +159,11 @@ notion-proxy
 
 ### 新 thread 首轮输入上限
 
-每次新建 Notion thread（首次绑定、resync、auto mode 分类器等辅助请求、切换 workspace）时，首轮输入最多 60000 字符（`NOTION_GATEWAY_NEW_THREAD_MAX_CHARS`）。超出时先丢最早的历史，单条仍太长就保留开头和结尾、截掉中间。之后的轮次照常只发增量。
+每次新建 Notion thread（首次绑定、独立辅助请求、切换 workspace）时，首轮输入预算默认 60000 个 JSON 转义后的 UTF-8 字节（`NOTION_GATEWAY_NEW_THREAD_MAX_CHARS`），同时受 `NOTION_GATEWAY_MAX_SEND_CHARS` 的单次发送保护限制。预算包含系统提示和工具定义。超出时先丢最早的完整历史轮次；单条文本超过首轮用量预算时保留头尾，若仍超过发送保护上限则返回 413。之后的轮次照常只发增量。
+
+同一客户端会话默认一直复用原 Notion thread，`NOTION_GATEWAY_THREAD_MAX_CHARS=0` 表示不因累计长度换线程，累计历史可以超过 300K；这不代表 Notion 模型保证保留全部历史。将新线程预算设为 `300000` 也不会绕过默认 `180000` 字节的单次发送保护。Notion 新建线程时会多次保存输入，直接提高发送保护可能触发其 409600 字节的内部写入限制。
+
+历史压缩或编辑在原 thread 上重同步，不受较小的首轮预算限制。Claude Code 的离开后自动回顾也复用原 thread，但单独缓存响应，不覆盖主对话的历史快照，避免下一句用户消息触发不必要的全量重同步。
 
 ### 额度用完自动切换 workspace
 
@@ -170,7 +174,7 @@ notion-proxy --profile default --failover team,team2
 （也可以设置环境变量 `NOTION_GATEWAY_FAILOVER_PROFILES=team,team2`。）
 
 - 当前 workspace 返回 429 或额度用完时，代理会自动换到下一个 profile，同一个客户端对话继续进行，不需要新建。
-- 切换的那一轮只把最近一段客户端历史（默认 60000 字符，`NOTION_GATEWAY_FAILOVER_SEED_CHARS`）带到新 workspace 的新 thread，之后照常只发增量。
+- 切换的那一轮只把最近一段客户端历史（默认 60000 个 JSON 转义后的 UTF-8 字节，`NOTION_GATEWAY_FAILOVER_SEED_CHARS`，同时受首轮和单次发送预算限制）带到新 workspace 的新 thread，之后照常只发增量。
 - 请求启动慢、无进展或超时不会触发 workspace 切换，也不会将 workspace 标记为额度耗尽；只有收到明确的额度耗尽或限流信号才切换。原有总超时和空闲超时仍然生效，同一请求重试时继续轮询原会话。
 - 只在本轮答案还没交付给客户端时切换，工具调用不会重复执行。
 - 对话切过去后会留在新 workspace；原 workspace 恢复后也不会来回跳。冷却时间优先采用 Notion 返回的 `Retry-After`，否则默认 1800 秒（`NOTION_GATEWAY_EXHAUSTED_COOLDOWN`）。
@@ -238,7 +242,7 @@ macOS/Linux 不使用全局命令时，也可通过仓库 `.venv/bin/python` 和
 | `Could not stop previous Notion proxy` | 旧网关进程关不掉（例如属于其他用户），手动 `kill` 后重试 |
 | `createAgentThread` 400 / 超长上下文 413 | 18 万字节预算只检查提取增量后、JSON 转义后的 UTF-8 内容；中文和反斜杠也按实际大小计入。完整客户端历史可达 400 万字符（HTTP 请求另限 128 MB）。首次导入/重同步会按完整用户轮次移除最旧历史并告知模型；单轮仍超限时需压缩或分批 |
 | 回复看起来停顿 | SSE 会保持心跳，但 JSON 工具结果要完整生成并校验后才能发送 |
-| 偶尔又新建了一个 Notion 聊天 | 正常续轮复用；上次结果未确定而客户端上下文改变时，会用完整客户端历史在新 thread 恢复，避免执行旧工具结果 |
+| 偶尔又新建了一个 Notion 聊天 | 主对话续轮、失败恢复和历史重同步均复用；新客户端会话、独立辅助请求、明确额度耗尽后的 workspace 切换，以及显式启用的长度轮换仍可能新建 |
 | 只在浏览器看到 JSON，项目没变化 | 不算编程成功；检查客户端是否真的执行 Read/Edit/Bash 或 exec_command/apply_patch，并查看测试结果 |
 
 ## 数据存放和限制
@@ -251,7 +255,7 @@ macOS/Linux 不使用全局命令时，也可通过仓库 `.venv/bin/python` 和
 
 这些优化减少代理重复上传的数据，不能据此推算 Notion 的额度消耗或计费：Notion 仍管理其远端会话历史，具体缓存和计量方式不由代理控制。审计日志中的 `client_input_chars` / `upstream_input_chars` 用于区分完整客户端输入和本轮实际发送量；客户端 token usage 不是官方账单。
 
-普通续聊采用增量历史。重试同一请求会复用已验证结果及工具 ID。网络结果不确定且客户端改变上下文时，会建立恢复 thread；此前的远端任务可能仍会完成，但其工具结果不会自动执行。原聊天记录不会被自动删除。详细实现和限制见 [网关文档](docs/LOCAL_CODING_GATEWAY.md)。
+普通续聊采用增量历史。重试同一请求会复用已验证结果及工具 ID。网络结果不确定且客户端改变上下文时，先在原 thread 等待旧轮次结束，再使用当前客户端历史继续；旧轮次未交付的工具结果不会自动执行。旧轮次仍未结束时返回超时或错误，保留绑定供后续重试，不会因此偷偷新建 thread。原聊天记录不会被自动删除。详细实现和限制见 [网关文档](docs/LOCAL_CODING_GATEWAY.md)。
 
 ## 开发验证
 

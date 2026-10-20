@@ -230,7 +230,15 @@ class NotionAgent:
                     if partial != seen:
                         seen = partial
                         on_text(partial)
-                result = state.result()
+                try:
+                    result = state.result()
+                except UpstreamError as exc:
+                    if state.turn_id:
+                        # A failed but completed turn is safe to advance past on
+                        # a changed request. An unfinished turn is not.
+                        exc.completed_turn = {"cursor": state.cursor, "sequence": state.sequence,
+                                              "turn_id": state.turn_id}
+                    raise
                 if result is not None:
                     return result, state.cursor, state.sequence, state.turn_id
                 if state.session.get("pending_input"):

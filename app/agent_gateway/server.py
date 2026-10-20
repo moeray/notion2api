@@ -23,7 +23,7 @@ from .protocol import (ProtocolError, prepare_request, parse_answer, estimate_to
 from .upstream import NotionAgent, UpstreamError, PUBLIC_MODEL
 from .responses import PICKER_MODEL, convert_request, convert_answer, response_object, output_events, response_usage
 from .routing import passthrough, HOP_HEADERS
-from .sessions import SessionStore, client_session
+from .sessions import SessionStore, client_session, is_away_summary
 from .config import ROOT, LOCAL, PROFILE, PROFILE_LOCAL, PROFILES, CATALOG, profile_path
 from .pool import WorkspacePool
 
@@ -185,6 +185,7 @@ async def messages(request: Request):
         return StreamingResponse(local_stream(), media_type="text/event-stream",
                                  headers={**headers, "cache-control": "no-cache"})
     session_key, session_source = client_session(request.headers, body, "messages")
+    preserve_history = session_source in {"claude-header", "claude-metadata"} and is_away_summary(body)
     if options["stop_sequences"] or options["schema"] is not None:
         # Side requests (e.g. auto-mode safety classifier) reuse the main session header;
         # keep them out of the main Notion thread so its history is never resynced.
@@ -204,7 +205,8 @@ async def messages(request: Request):
         try:
             async with session_lock(session_key):
                 result, info = await app.state.pool.run(app.state.sessions, session_key, prompt, effort, render,
-                                                        progress, stateless=session_source == "side-request")
+                                                        progress, stateless=session_source == "side-request",
+                                                        preserve_history=preserve_history)
             result = {**result, "id": message_id}
             audit({"id": message_id, "event": "completed", "model": PUBLIC_MODEL,
                    **info, "session_source": session_source, "duration_s": round(time.monotonic() - started, 2),

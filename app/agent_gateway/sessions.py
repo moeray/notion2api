@@ -73,6 +73,21 @@ def client_session(headers, body, protocol):
     return digest([protocol, identity, agent, request_class]), source
 
 
+def is_away_summary(body):
+    """Claude Code's background recap is not part of its next main history."""
+    messages = [m for m in body.get("messages", []) if m.get("role") != "system"]
+    if not messages or messages[-1].get("role") != "user":
+        return False
+    content = messages[-1].get("content", "")
+    if isinstance(content, list):
+        if not all(b.get("type") == "text" for b in content):
+            return False
+        content = "\n".join(b.get("text", "") for b in content)
+    return isinstance(content, str) and content.startswith(
+        "The user stepped away and is coming back. Recap in under 40 words, "
+        "1-2 plain sentences, no markdown.")
+
+
 def stable_directive(block):
     if block.get("type") != "text":
         return block
@@ -254,14 +269,18 @@ def incremental_prompt(prompt, record, budget=None):
     truncated = sum(a != b for a, b in zip(pending_atoms, kept))
     omitted = 0
     if not append:
-        # A full-history send must fit; the oldest turns are the cheapest to lose.
+        # Only a fresh thread needs the seed cap. Resync still has earlier context
+        # in Notion and must not discard it just to meet the smaller seed budget.
         overhead = wire_size(preamble) + size({"mode": mode, **changes}) + 2000
-        cap = min(budget or MAX_SEND_CHARS, NEW_THREAD_MAX_CHARS or MAX_SEND_CHARS)
+        cap = min(budget or MAX_SEND_CHARS, MAX_SEND_CHARS)
+        if not record:
+            cap = min(cap, NEW_THREAD_MAX_CHARS or MAX_SEND_CHARS)
         kept, omitted = drop_oldest(kept, cap - overhead)
-        if NEW_THREAD_MAX_CHARS:
+        if not record and NEW_THREAD_MAX_CHARS:
             # Shrinking single items only serves the usage cap; a turn still over
             # MAX_SEND_CHARS is rejected explicitly below instead of being hidden.
-            kept, shortened = fit_atoms(kept, max(8000, NEW_THREAD_MAX_CHARS - overhead))
+            usage_cap = min(budget or NEW_THREAD_MAX_CHARS, NEW_THREAD_MAX_CHARS)
+            kept, shortened = fit_atoms(kept, max(0, usage_cap - overhead))
             truncated += shortened
     payload = {"mode": mode, **changes, "messages": group(kept)}
     if omitted:
@@ -273,12 +292,19 @@ def incremental_prompt(prompt, record, budget=None):
         payload["unset"] = unset
     if acknowledged and previous.get("tool_ids"):
         payload["previous_tool_ids"] = previous["tool_ids"]
+    if record.get("discarded_turn"):
+        payload["previous_response_not_delivered"] = True
     snapshot["truncated_tool_results"] = truncated
+    snapshot["omitted_earlier_items"] = omitted
     instructions = (
         "Continue the existing client conversation; do not repeat prior actions. Keep unchanged settings. "
         "Fields ending _append add to the named setting; unset removes settings. previous_tool_ids maps "
         "your previous tool calls in order to client-assigned IDs. Respond only to new messages, in the "
-        "same JSON content envelope. Resync replaces client history with supplied history.\n"
+        "same JSON content envelope. Resync supplies the client's current history window; retain relevant "
+        "earlier context in this thread unless the client explicitly corrects it. Omitted history is not "
+        "a request to forget it. Historical tool calls are not new actions. If previous_response_not_delivered "
+        "is true, the client did not receive your last response or execute its proposed local tools; "
+        "answer the current request using the supplied client history as the authority for executed actions.\n"
     )
     # The complete protocol description is needed only on initial binding/resync.
     rendered = (preamble if not previous else "") + instructions + MARKER + json.dumps(
@@ -315,12 +341,14 @@ class SessionStore:
         with self.db:
             self.db.execute("INSERT OR REPLACE INTO sessions VALUES (?, ?)", (self.storage_key(key), json.dumps(record)))
 
-    async def run(self, upstream, key, prompt, effort, render, progress=None, stateless=False):
+    async def run(self, upstream, key, prompt, effort, render, progress=None, stateless=False,
+                  preserve_history=False):
         record = self.get(key)
         sent, snapshot, fingerprint, mode = incremental_prompt(prompt, record)
         fingerprint = digest([fingerprint, effort])
-        if record.get("fingerprint") == fingerprint and record.get("result"):
-            return record["result"], {**record["audit"], "cached": True}
+        cached = record.get("auxiliary_cache", {}) if preserve_history else record
+        if cached.get("fingerprint") == fingerprint and cached.get("result"):
+            return cached["result"], {**cached["audit"], "cached": True}
         pending = record.get("pending")
         superseded = None
         scope = getattr(upstream, "account_scope", None)
@@ -344,12 +372,34 @@ class SessionStore:
             sent, snapshot, _, mode = incremental_prompt(prompt, record, SIDE_MAX_SEND_CHARS or None)
             pending = None
         elif pending and pending["fingerprint"] != fingerprint:
-            # A client may change context after a disconnect, timeout or failed
-            # validation. It cannot reproduce the exact old fingerprint reliably.
-            # Never append to that uncertain thread or deliver its stale tool calls.
-            # Rebuild from the authoritative client history on a fresh thread.
-            superseded = record
-            record = {}
+            # Drain the prior turn before appending; a changed retry must not
+            # silently create a new thread or deliver stale executable output.
+            if "answer" not in pending:
+                try:
+                    text, cursor, sequence, turn_id = await upstream.wait_for_turn(
+                        record["thread_id"], record.get("cursor"), record.get("sequence", -1),
+                        record.get("turn_id"))
+                except UpstreamError as exc:
+                    completed = getattr(exc, "completed_turn", None)
+                    if exc.exhausted or not completed:
+                        raise
+                    text = ""
+                    cursor, sequence, turn_id = (completed[k] for k in ("cursor", "sequence", "turn_id"))
+                pending.update(answer=text, cursor=cursor, sequence=sequence, turn_id=turn_id)
+                record["thread_chars"] = record.get("thread_chars", 0) + pending["input_chars"] + len(text)
+            record.update(cursor=pending["cursor"], sequence=pending["sequence"], turn_id=pending["turn_id"],
+                          discarded_turn=True)
+            if not pending.get("preserve_history"):
+                record["snapshot"] = pending["snapshot"]
+                for field in ("fingerprint", "result", "audit"):
+                    record.pop(field, None)
+            else:
+                record["snapshot"] = {**record.get("snapshot", {}),
+                                      **{k: pending["snapshot"][k] for k in ("settings", "system_blocks")}}
+            record.pop("pending")
+            # Persist the completed cursor even if the next send is rejected or
+            # interrupted. A later retry continues this same thread.
+            self.save(key, record)
             sent, snapshot, _, mode = incremental_prompt(prompt, record)
             pending = None
         if not pending and THREAD_MAX_CHARS and record and mode == "append" and \
@@ -367,7 +417,8 @@ class SessionStore:
             continuation = bool(record)
             record = record or {"thread_id": str(uuid.uuid4()), "effort": effort, **({"scope": scope} if scope else {})}
             pending = {"fingerprint": fingerprint, "snapshot": snapshot, "mode": mode,
-                       "input_chars": len(sent), "input_bytes": wire_size(sent), "event_id": str(uuid.uuid4())}
+                       "input_chars": len(sent), "input_bytes": wire_size(sent), "event_id": str(uuid.uuid4()),
+                       "preserve_history": preserve_history}
             record["pending"] = pending
             # Commit BEFORE dispatch, so a disconnect/restart cannot create a second thread or turn.
             self.save(key, record)
@@ -400,12 +451,25 @@ class SessionStore:
                                             for a in output_atoms if a["content"]["type"] == "tool_use"]
         info = {"client_input_chars": len(prompt),
                 "truncated_tool_results": pending["snapshot"].get("truncated_tool_results", 0),
+                "omitted_earlier_items": pending["snapshot"].get("omitted_earlier_items", 0),
+                "auxiliary": preserve_history, "recovered_pending": bool(record.get("discarded_turn")),
                 "thread_id": record["thread_id"], "session_hash": key, "history_mode": pending["mode"],
                 "upstream_input_chars": pending["input_chars"],
                 "upstream_input_bytes": pending.get("input_bytes"), "cached": False,
                 "thread_effort": record["effort"], "thread_chars": record.get("thread_chars", 0)}
-        record.update(snapshot=pending["snapshot"], fingerprint=fingerprint, result=result, audit=info,
-                      cursor=pending["cursor"], sequence=pending["sequence"], turn_id=pending["turn_id"])
+        cache = {"fingerprint": fingerprint, "result": result, "audit": info}
+        if preserve_history:
+            # Recaps share the upstream thread, but must not become part of the
+            # main client's history or replace its last acknowledged tool IDs.
+            record["auxiliary_cache"] = cache
+            previous = record.get("snapshot", {})
+            record["snapshot"] = {**previous, **{k: pending["snapshot"][k]
+                                                 for k in ("settings", "system_blocks")}}
+        else:
+            record.update(snapshot=pending["snapshot"], **cache)
+            record.pop("auxiliary_cache", None)
+        record.update(cursor=pending["cursor"], sequence=pending["sequence"], turn_id=pending["turn_id"])
         record.pop("pending")
+        record.pop("discarded_turn", None)
         self.save(key, record)
         return result, info
