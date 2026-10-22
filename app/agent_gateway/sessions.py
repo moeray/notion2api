@@ -562,6 +562,18 @@ class SessionStore:
         row = self.db.execute("SELECT data FROM sessions WHERE key = ?", (self.storage_key(key),)).fetchone()
         return json.loads(row[0]) if row else {}
 
+    def _forget_thread(self, key, record, effort, scope):
+        """Drop the whole session so the next turn starts from scratch.
+
+        Used when Notion answers 404 for the thread this session is pinned to.
+        Fixing the binding in place is not enough: a thread-less record is still
+        truthy, so the next run would take the continuation path and then read
+        record["thread_id"] -- which no longer exists.
+        """
+        with self.db:
+            self.db.execute("DELETE FROM sessions WHERE key = ?", (self.storage_key(key),))
+        record.clear()
+
     def save(self, key, record):
         with self.db:
             self.db.execute("INSERT OR REPLACE INTO sessions VALUES (?, ?)", (self.storage_key(key), json.dumps(record)))
@@ -649,6 +661,11 @@ class SessionStore:
                         record["thread_id"], record.get("cursor"), record.get("sequence", -1),
                         record.get("turn_id"))
                 except UpstreamError as exc:
+                    if getattr(exc, "thread_gone", False):
+                        # The pinned thread was deleted upstream; drop it so the
+                        # next attempt rebuilds via create instead of 404-ing.
+                        self._forget_thread(key, record, effort, scope)
+                        raise
                     completed = getattr(exc, "completed_turn", None)
                     if exc.exhausted or not completed:
                         raise
@@ -724,9 +741,14 @@ class SessionStore:
                         # Advance the cursor past this chunk's answer, otherwise
                         # the final wait_for_turn replays the FIRST chunk reply
                         # and the client receives "已收到" instead of an answer.
-                        _text, _cursor, _seq, _turn = await upstream.wait_for_turn(
-                            record["thread_id"], record.get("cursor"),
-                            record.get("sequence", -1), record.get("turn_id"))
+                        try:
+                            _text, _cursor, _seq, _turn = await upstream.wait_for_turn(
+                                record["thread_id"], record.get("cursor"),
+                                record.get("sequence", -1), record.get("turn_id"))
+                        except UpstreamError as exc:
+                            if getattr(exc, "thread_gone", False):
+                                self._forget_thread(key, record, effort, scope)
+                            raise
                         record["cursor"], record["sequence"], record["turn_id"] = _cursor, _seq, _turn
                         # Give Notion a moment to settle the thread before the
                         # next chunk; back-to-back events on one thread 500.
@@ -747,12 +769,7 @@ class SessionStore:
                 self.save(key, record)
             except UpstreamError as exc:
                 if getattr(exc, "thread_gone", False):
-                    # PATCHED-BY-OPS: the pinned Notion thread no longer exists.
-                    # Keep the effort/scope but forget the thread, so the next
-                    # attempt goes through the create path instead of 404-ing.
-                    record.clear()
-                    record.update({"effort": effort, **({"scope": scope} if scope else {})})
-                    self.save(key, record)
+                    self._forget_thread(key, record, effort, scope)
                     raise
                 if exc.rejected:
                     record.pop("pending")
