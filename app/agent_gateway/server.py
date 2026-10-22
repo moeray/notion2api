@@ -26,6 +26,7 @@ from .routing import passthrough, HOP_HEADERS
 from .sessions import SessionStore, client_session, is_away_summary
 from .config import ROOT, LOCAL, PROFILE, PROFILE_LOCAL, PROFILES, CATALOG, profile_path
 from .pool import WorkspacePool
+from .usage import UsageReporter, context_usage, desktop_footer_enabled
 
 # Raw body bound; images travel as native attachments outside the text payload.
 MAX_REQUEST_BYTES = int(os.getenv("NOTION_GATEWAY_MAX_REQUEST_BYTES", "128000000"))
@@ -89,6 +90,7 @@ async def lifespan(app):
         scopes.add(agent.account_scope)
         members.append((name, agent))
     app.state.pool = WorkspacePool(members, skipped)
+    app.state.usage_reporter = UsageReporter()
     app.state.routes = json.loads((LOCAL / "routes.json").read_text()) if (LOCAL / "routes.json").exists() else {}
     app.state.proxy_http = httpx.AsyncClient(timeout=httpx.Timeout(300, connect=20), follow_redirects=False)
     # One turn at a time per client session; separate sessions and side requests run concurrently.
@@ -143,6 +145,26 @@ async def models():
             "first_id": PICKER_MODEL, "last_id": PICKER_MODEL}
 
 
+@app.get("/v1/notion/usage")
+@app.get("/claude/v1/notion/usage")
+async def notion_usage(request: Request):
+    key, source = client_session(request.headers, {}, "messages")
+    record = app.state.sessions.get(key) if source != "unidentified" else {}
+    scope = record.get("scope") or app.state.sessions.namespace
+    member = next((m for m in app.state.pool.members if m[1].account_scope == scope), None)
+    tokens = record.get("result", {}).get("usage", {}).get("input_tokens")
+    if member is None and record.get("scope"):
+        return JSONResponse({"source": "notion", "status": "unavailable", "profile": None,
+                             "rolling": None, "billing_period": None, "observed_at": None,
+                             "reason": "session_workspace_unavailable", "context": context_usage(tokens)},
+                            headers={"cache-control": "no-store"})
+    member = member or app.state.pool.members[0]
+    name, upstream = member
+    quota = await app.state.usage_reporter.read(upstream)
+    return JSONResponse({**quota, "profile": name, "context": context_usage(tokens)},
+                        headers={"cache-control": "no-store"})
+
+
 @app.post("/v1/messages")
 @app.post("/claude/v1/messages")
 async def messages(request: Request):
@@ -191,6 +213,8 @@ async def messages(request: Request):
         # keep them out of the main Notion thread so its history is never resynced.
         session_key = hashlib.sha256((session_key + json.dumps(options, sort_keys=True)).encode()).hexdigest()
         session_source = "side-request"
+    decorate = (app.state.usage_reporter.decorate
+                if desktop_footer_enabled(request.headers, body, options, preserve_history) else None)
 
     def render(text):
         content, stop = parse_answer(text, tools, choice)
@@ -206,7 +230,7 @@ async def messages(request: Request):
             async with session_lock(session_key):
                 result, info = await app.state.pool.run(app.state.sessions, session_key, prompt, effort, render,
                                                         progress, stateless=session_source == "side-request",
-                                                        preserve_history=preserve_history)
+                                                        preserve_history=preserve_history, decorate=decorate)
             result = {**result, "id": message_id}
             audit({"id": message_id, "event": "completed", "model": PUBLIC_MODEL,
                    **info, "session_source": session_source, "duration_s": round(time.monotonic() - started, 2),

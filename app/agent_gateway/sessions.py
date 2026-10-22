@@ -460,7 +460,7 @@ class SessionStore:
             await upstream.start_turn(text, effort, record["thread_id"], pending["event_id"], continuation)
 
     async def run(self, upstream, key, prompt, effort, render, progress=None, stateless=False,
-                  preserve_history=False):
+                  preserve_history=False, decorate=None):
         record = self.get(key)
         sent, snapshot, fingerprint, mode = incremental_prompt(prompt, record)
         fingerprint = digest([fingerprint, effort])
@@ -642,6 +642,10 @@ class SessionStore:
                 await self.dispatch(upstream, record, correction, effort, True)
                 pending["dispatch_accepted"] = True
                 self.save(key, record)
+        if decorate is not None:
+            # Persist exactly the displayed answer so its next acknowledgement
+            # stays incremental, including the gateway's optional usage footer.
+            result = await decorate(result, upstream)
         output_atoms = delivered_atoms(result)
         pending["snapshot"]["assistant"] = [digest(a) for a in output_atoms]
         pending["snapshot"]["tool_ids"] = [{"id": a["content"]["id"], "name": a["content"]["name"]}

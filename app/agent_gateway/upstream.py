@@ -160,7 +160,7 @@ class NotionAgent:
     async def post(self, endpoint: str, body: dict):
         # Read-only requests are safe to retry. Writes require session-level
         # reconciliation; never replay a generation POST because its response broke.
-        attempts = 3 if endpoint in {"getThreadTranscript", "getAvailableModels"} else 1
+        attempts = 3 if endpoint in {"getThreadTranscript", "getAvailableModels", "getCreditRateLimitStatus"} else 1
         for attempt in range(attempts):
             try:
                 response = await self.client.post("/api/v3/" + endpoint, json=body)
