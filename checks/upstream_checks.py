@@ -10,6 +10,7 @@ from app.agent_gateway.upstream import NotionAgent, UpstreamError
 class UpstreamChecks(unittest.IsolatedAsyncioTestCase):
     async def test_absent_turn_requires_repeated_explicit_idle_checkpoint(self):
         agent = object.__new__(NotionAgent)
+        agent.base_url = 'https://app.notion.com'
         agent.space_id = 's'
         idle = {'session': {'status': 'idle', 'sequence': 10}, 'session_pending': False,
                 'forward_after_sequence': 10, 'has_more_forward': False, 'patches': []}
@@ -35,6 +36,7 @@ class UpstreamChecks(unittest.IsolatedAsyncioTestCase):
 
     async def test_absent_turn_cannot_infer_rejection_from_missing_thread_or_failed_read(self):
         agent = object.__new__(NotionAgent)
+        agent.base_url = 'https://app.notion.com'
         agent.space_id = 's'
         agent.post = AsyncMock(side_effect=UpstreamError('read failed'))
         self.assertFalse(await agent.turn_is_absent('thread', None, -1, None))
@@ -48,7 +50,9 @@ class UpstreamChecks(unittest.IsolatedAsyncioTestCase):
             session.write_text(json.dumps({'origin':'https://app.notion.com','space_id':'s',
                                            'user_id':'u','cookies':[]}))
             agent = NotionAgent(session)
-            await agent.client.aclose()
+            closer = getattr(agent.client, 'aclose', None) or getattr(agent.client, 'close', None)
+            if closer is not None:
+                await closer()
             agent.client = httpx.AsyncClient(base_url='https://app.notion.com',
                 transport=httpx.MockTransport(lambda request: httpx.Response(200, json={
                     'forward_cursor':'done-cursor','forward_after_sequence':20,
@@ -67,7 +71,9 @@ class UpstreamChecks(unittest.IsolatedAsyncioTestCase):
             session.write_text(json.dumps({'origin':'https://app.notion.com','space_id':'s',
                                            'user_id':'u','cookies':[]}))
             agent = NotionAgent(session)
-            await agent.client.aclose()
+            closer = getattr(agent.client, 'aclose', None) or getattr(agent.client, 'close', None)
+            if closer is not None:
+                await closer()
             def respond(request):
                 return httpx.Response(400, json={'name':'ValidationError','errorId':'test-id',
                     'debugMessage':'create_session DynamoDB transaction action is 411174 bytes; max is 409600',

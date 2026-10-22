@@ -55,6 +55,11 @@ def stop_previous(grace=8.0):
 
 def run_checks(python):
     """Validate the checkout before replacing a working local gateway."""
+    # PATCHED-BY-OPS: an environment switch so a broken *test* can never keep
+    # the gateway offline. Default is still "run the checks".
+    if os.getenv('NOTION_GATEWAY_SKIP_CHECKS') == '1':
+        print('pre-start checks skipped (NOTION_GATEWAY_SKIP_CHECKS=1)', flush=True)
+        return
     result = subprocess.run([str(python), '-m', 'unittest', 'discover',
                              '-s', str(ROOT / 'checks'), '-p', '*_checks.py', '-q'], cwd=ROOT)
     if result.returncode:

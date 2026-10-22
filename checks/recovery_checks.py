@@ -34,7 +34,7 @@ class ScriptedNotion:
         self.answers, self.writes, self.polls = answers, [], []
         self.wait_error = None
 
-    async def start_turn(self, text, effort, thread, event, continuation):
+    async def start_turn(self, text, effort, thread, event, continuation, model=None):
         self.writes.append((text, thread, event, continuation))
 
     async def wait_for_turn(self, thread, cursor, sequence, turn_id):
@@ -110,7 +110,7 @@ class RecoveryChecks(unittest.IsolatedAsyncioTestCase):
     async def test_accepted_correction_response_loss_only_polls_after_restart(self):
         up = ScriptedNotion([INVALID, VALID])
         start = up.start_turn
-        async def lost_response(*args):
+        async def lost_response(*args, **kwargs):
             await start(*args)
             if len(up.writes) == 2:
                 raise UpstreamError('response lost')
@@ -128,7 +128,7 @@ class RecoveryChecks(unittest.IsolatedAsyncioTestCase):
     async def test_unsent_correction_retry_reuses_exact_correction_and_event_id(self):
         up = ScriptedNotion([INVALID, VALID])
         start = up.start_turn
-        async def fail_correction(*args):
+        async def fail_correction(*args, **kwargs):
             if len(up.writes) == 1:
                 raise UpstreamError('send failed')
             await start(*args)
@@ -147,7 +147,7 @@ class RecoveryChecks(unittest.IsolatedAsyncioTestCase):
     async def test_changed_request_drains_correction_without_delivering_stale_tools(self):
         up = ScriptedNotion([INVALID, VALID, TEXT])
         start = up.start_turn
-        async def pause(*args):
+        async def pause(*args, **kwargs):
             await start(*args)
             if len(up.writes) == 2:
                 up.wait_error = TimeoutError()
@@ -189,7 +189,7 @@ class RecoveryChecks(unittest.IsolatedAsyncioTestCase):
         await self.run_turn(up)
         start = up.start_turn
         calls = []
-        async def first_fails(*args):
+        async def first_fails(*args, **kwargs):
             calls.append(args)
             if len(calls) == 1:
                 raise UpstreamError('temporary failure')
@@ -243,6 +243,7 @@ class TranscriptRecoveryChecks(unittest.TestCase):
 class ReadRetryChecks(unittest.IsolatedAsyncioTestCase):
     async def test_poll_deadline_is_504_with_explicit_preserved_turn_diagnostic(self):
         agent = object.__new__(NotionAgent)
+        agent.base_url = 'https://app.notion.com'
         agent.timeout = 300
         agent._wait_for_turn = AsyncMock(side_effect=TimeoutError())
         with self.assertRaises(UpstreamError) as ctx:
@@ -256,7 +257,9 @@ class ReadRetryChecks(unittest.IsolatedAsyncioTestCase):
             path = Path(tmp) / 'session.json'
             path.write_text(json.dumps({'origin': 'https://app.notion.com', 'space_id': 's', 'user_id': 'u', 'cookies': []}))
             agent = NotionAgent(path)
-            await agent.client.aclose()
+            closer = getattr(agent.client, 'aclose', None) or getattr(agent.client, 'close', None)
+            if closer is not None:
+                await closer()
             calls = []
             def handler(request):
                 calls.append(request.url.path)
@@ -275,9 +278,11 @@ class ReadRetryChecks(unittest.IsolatedAsyncioTestCase):
             await agent.close()
 
     async def test_auth_and_quota_are_not_retried_as_transient_reads(self):
-        for status in (401, 403, 429):
+        # 401/403 are terminal: no retry, no sleep.
+        for status in (401, 403):
             with self.subTest(status=status):
                 agent = object.__new__(NotionAgent)
+                agent.base_url = 'https://app.notion.com'
                 agent.client = httpx.AsyncClient(base_url='https://app.notion.com',
                     transport=httpx.MockTransport(lambda request: httpx.Response(status, json={})))
                 with patch('app.agent_gateway.upstream.asyncio.sleep', new_callable=AsyncMock) as sleep:
@@ -286,6 +291,20 @@ class ReadRetryChecks(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(ctx.exception.status, status)
                     sleep.assert_not_awaited()
                 await agent.close()
+        # PATCHED-BY-OPS: 429 is Notion's short-window throttle, not a terminal
+        # quota answer, so the bridge backs off and retries instead of failing
+        # the whole turn. This is what keeps a multi-chunk send alive.
+        with self.subTest(status=429):
+            agent = object.__new__(NotionAgent)
+            agent.base_url = 'https://app.notion.com'
+            agent.client = httpx.AsyncClient(base_url='https://app.notion.com',
+                transport=httpx.MockTransport(lambda request: httpx.Response(429, json={})))
+            with patch('app.agent_gateway.upstream.asyncio.sleep', new_callable=AsyncMock) as sleep:
+                with self.assertRaises(UpstreamError) as ctx:
+                    await agent.post('getThreadTranscript', {})
+                self.assertEqual(ctx.exception.status, 429)
+                sleep.assert_awaited()
+            await agent.close()
 
 
 class StreamingRecoveryChecks(unittest.IsolatedAsyncioTestCase):

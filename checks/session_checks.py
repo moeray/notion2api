@@ -1,4 +1,5 @@
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -22,7 +23,7 @@ class FakeNotion:
         self.timeout = False
         self.reject = False
 
-    async def start_turn(self, text, effort, thread, event, continuation):
+    async def start_turn(self, text, effort, thread, event, continuation, model=None):
         if self.reject:
             raise UpstreamError("rejected", rejected=True)
         self.writes.append((thread, continuation, text))
@@ -42,10 +43,10 @@ class ScopedNotion(FakeNotion):
         self.exhausted = False
         self.wait_error = None
 
-    async def start_turn(self, text, effort, thread, event, continuation):
+    async def start_turn(self, text, effort, thread, event, continuation, model=None):
         if self.exhausted:
             raise UpstreamError("quota", 429, rejected=True, exhausted=True)
-        await super().start_turn(text, effort, thread, event, continuation)
+        await super().start_turn(text, effort, thread, event, continuation, model=model)
 
     async def wait_for_turn(self, thread, cursor, sequence, turn_id):
         if self.wait_error is not None:
@@ -178,7 +179,8 @@ class SessionChecks(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("Remember violet", self.up.writes[1][2])
         self.assertIn("What color?", self.up.writes[1][2])
         self.assertEqual(self.up.polls[1][1:], ("cursor1", 10, "turn1"))
-        self.assertEqual(self.path.stat().st_mode & 0o777, 0o600)
+        if os.name != 'nt':  # Windows has no POSIX permission bits
+            self.assertEqual(self.path.stat().st_mode & 0o777, 0o600)
 
     async def test_identical_retry_returns_cached_response_without_new_turn(self):
         a, _ = await self.run_turn()

@@ -41,10 +41,14 @@ QUOTA_MARKERS = ("rate limit", "ratelimit", "rate_limit", "quota", "credit", "us
 
 class UpstreamError(Exception):
     def __init__(self, message: str, status: int = 502, rejected: bool = False, exhausted: bool = False,
-                 retry_after: float | None = None):
+                 retry_after: float | None = None, thread_gone: bool = False):
         super().__init__(message)
         self.status = status
         self.rejected = rejected
+        # PATCHED-BY-OPS: Notion deleted the thread this session is pinned to
+        # (404 Agent thread not found). The binding must be dropped, otherwise
+        # every retry hits the same dead thread.
+        self.thread_gone = thread_gone
         self.diagnostics = {}
         # Workspace quota/rate limit: the gateway may continue the session in another workspace.
         self.exhausted = exhausted
@@ -178,10 +182,12 @@ class NotionAgent:
             )
 
     async def close(self):
-        if _HAS_CURL_CFFI:
-            await self.client.close()
-        else:
-            await self.client.aclose()
+        # PATCHED-BY-OPS: curl_cffi exposes close(), httpx exposes aclose().
+        # Pick whichever this client actually has instead of trusting the flag -
+        # tests build a plain httpx client even when curl_cffi is installed.
+        closer = getattr(self.client, "aclose", None) or getattr(self.client, "close", None)
+        if closer is not None:
+            await closer()
 
     async def post(self, endpoint: str, body: dict):
         url = self.base_url + "/api/v3/" + endpoint
@@ -223,9 +229,14 @@ class NotionAgent:
         if response.status_code != 200:
             status = response.status_code if response.status_code in {401, 403, 429} else 502
             # Never include arbitrary upstream response bodies, credentials or trace URLs.
+            body_text = response.text[:2000] if hasattr(response, "text") else ""
+            gone = (response.status_code == 404
+                    and ("thread not found" in body_text.lower()
+                         or "NotFoundError" in body_text))
             error = UpstreamError(f"Notion {endpoint} returned HTTP {response.status_code}", status,
                                   rejected=400 <= response.status_code < 500 and response.status_code != 408,
-                                  exhausted=quota_signal(response), retry_after=retry_after_seconds(response))
+                                  exhausted=quota_signal(response), retry_after=retry_after_seconds(response),
+                                  thread_gone=gone)
             try:
                 detail = response.json()
             except ValueError:

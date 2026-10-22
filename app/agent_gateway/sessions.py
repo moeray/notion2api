@@ -566,6 +566,29 @@ class SessionStore:
         with self.db:
             self.db.execute("INSERT OR REPLACE INTO sessions VALUES (?, ?)", (self.storage_key(key), json.dumps(record)))
 
+    async def dispatch(self, upstream, record, text, effort, continuation, model=None):
+        pending = record["pending"]
+        try:
+            extra = {} if model is None else {"model": model}
+            await upstream.start_turn(text, effort, record["thread_id"], pending["event_id"], continuation,
+                                      **extra)
+        except UpstreamError as exc:
+            if (not continuation or exc.rejected or exc.exhausted or exc.status < 500
+                    or not hasattr(upstream, "turn_is_absent")):
+                raise
+            absent = await upstream.turn_is_absent(record["thread_id"], record.get("cursor"),
+                                                   record.get("sequence", -1), record.get("turn_id"),
+                                                   pending.get("submitted_at"))
+            if not absent:
+                # The write may have been accepted; the caller will poll it on retry.
+                raise
+            # One bounded retry, using the same event ID and exact payload, only
+            # after the unchanged remote checkpoint proves it was not accepted.
+            pending["submission_retries"] = pending.get("submission_retries", 0) + 1
+            extra = {} if model is None else {"model": model}
+            await upstream.start_turn(text, effort, record["thread_id"], pending["event_id"], continuation,
+                                      **extra)
+
     async def run(self, upstream, key, prompt, effort, render, progress=None, stateless=False,
                   preserve_history=False, decorate=None, model=None):
         record = self.get(key)
@@ -653,7 +676,11 @@ class SessionStore:
         # wrong twice over: sendEventToAgentThread caps at ~13.7万 chars (vs 20万
         # for a new thread) and it is throttled harder. Rebuild the thread and
         # use the creation path, which is what a resync semantically is.
-        if not pending and record and mode == "resync":
+        if not pending and record and mode == "resync" and wire_size(sent) > EVENT_MAX_CHARS:
+            # PATCHED-BY-OPS: rebuilding is only needed when the full history no
+            # longer fits one follow-up event (~13.7万 chars, throttled harder
+            # than create). A small resync keeps the thread, so dispatch's
+            # bounded safe-retry still applies.
             superseded = record
             record = {}
             sent, snapshot, _, _ = incremental_prompt(prompt, record)
@@ -692,7 +719,8 @@ class SessionStore:
                         label = ("[历史片段 %d/%d - 请只回复收到，不要执行任何操作]\n"
                                  % (index, len(parts) - 1))
                         await upstream.start_turn(label + part, effort, record["thread_id"],
-                                                  str(uuid.uuid4()), True, model=model)
+                                                  str(uuid.uuid4()), True,
+                                                  **({} if model is None else {"model": model}))
                         # Advance the cursor past this chunk's answer, otherwise
                         # the final wait_for_turn replays the FIRST chunk reply
                         # and the client receives "已收到" instead of an answer.
@@ -718,6 +746,14 @@ class SessionStore:
                 pending["dispatch_accepted"] = True
                 self.save(key, record)
             except UpstreamError as exc:
+                if getattr(exc, "thread_gone", False):
+                    # PATCHED-BY-OPS: the pinned Notion thread no longer exists.
+                    # Keep the effort/scope but forget the thread, so the next
+                    # attempt goes through the create path instead of 404-ing.
+                    record.clear()
+                    record.update({"effort": effort, **({"scope": scope} if scope else {})})
+                    self.save(key, record)
+                    raise
                 if exc.rejected:
                     record.pop("pending")
                     if superseded is not None:

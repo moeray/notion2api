@@ -1,3 +1,4 @@
+import os
 import json
 import shlex
 import tempfile
@@ -52,9 +53,11 @@ class SetupChecks(unittest.TestCase):
             key = (folder / "gateway-key").read_text()
             ensure_key(folder)
             self.assertEqual(key, (folder / "gateway-key").read_text())
-            self.assertEqual((folder / "gateway-key").stat().st_mode & 0o777, 0o600)
+            if os.name != 'nt':  # Windows has no POSIX permission bits
+                self.assertEqual((folder / "gateway-key").stat().st_mode & 0o777, 0o600)
             private_write(folder / "profile.json", "private")
-            self.assertEqual((folder / "profile.json").stat().st_mode & 0o777, 0o600)
+            if os.name != 'nt':  # Windows has no POSIX permission bits
+                self.assertEqual((folder / "profile.json").stat().st_mode & 0o777, 0o600)
 
     def test_accounts_workspaces_isolated_and_legacy_binding_preserved(self):
         with tempfile.TemporaryDirectory() as tmp:
