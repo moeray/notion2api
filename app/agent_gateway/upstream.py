@@ -55,6 +55,33 @@ class UpstreamError(Exception):
         self.retry_after = retry_after
 
 
+def _quota_retry_after(response):
+    """Seconds until the quota resets, from the 429 body (not the header).
+
+    Notion puts it in clientData.retryAfter; the HTTP retry-after header is
+    absent. Returns None when the field is missing or unparsable, which means
+    "treat as a short throttle".
+    """
+    try:
+        payload = response.json()
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    client = payload.get("clientData") or {}
+    if not isinstance(client, dict):
+        client = {}
+    for source in (client, payload):
+        value = source.get("retryAfter")
+        if value is None:
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
 def quota_signal(response):
     if response.status_code == 429:
         return True
@@ -212,11 +239,19 @@ class NotionAgent:
                                      "transport_error": type(exc).__name__,
                                      "read_attempts": attempt + 1}
                 raise error from None
-            # PATCHED-BY-OPS: Notion's short-window throttle answers 429 with a
-            # billing-period retryAfter that is useless for a live turn. Back
-            # off briefly (5s, 10s) and retry instead of failing the request -
-            # this is what keeps a large multi-chunk turn alive.
+            # PATCHED-BY-OPS: distinguish the two 429s Notion sends.
+            #   short-window throttle -> no/large-enough gap, retry (5s, 10s)
+            #   billing-period quota  -> retryAfter is days away, give up now
+            # Without the second branch a quota 429 keeps the request inside
+            # notion2api for ~35s while the aggregator waits to fail over
+            # (measured: a 40s turn that wb could have served in 2s).
             if response.status_code == 429 and attempt + 1 < attempts:
+                quota_wait = _quota_retry_after(response)
+                if quota_wait is not None and quota_wait > 300:
+                    print("[rate-limit] %s 429 quota (retryAfter=%ds); not retrying, "
+                          "letting the caller fail over" % (endpoint, int(quota_wait)),
+                          flush=True)
+                    break
                 wait = 5 * (2 ** attempt)
                 print("[rate-limit] %s 429, retry %d/%d in %ds"
                       % (endpoint, attempt + 1, attempts - 1, wait), flush=True)
