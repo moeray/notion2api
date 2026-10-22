@@ -10,14 +10,14 @@
 
 ## 支持范围
 
-- Anthropic Messages：`POST /v1/messages`。
+- Anthropic Messages：`POST /v1/messages`，支持 CC Desktop / Claude Code 的 base64 图片附件和工具返回图片（PNG/JPEG/GIF/WebP，单张最多 20 MiB，每次转发最多 19 张不同图片）。
 - OpenAI Responses：`POST /v1/responses`，支持本地 function/custom 工具，包括 `apply_patch`。
 - 同一个客户端对话正常续轮复用同一个 Notion thread，工具结果也在其中续聊；绑定保存在本地，重启代理后可恢复。
 - 多账号、多 workspace 使用独立 profile；数据库按账号和 workspace 隔离。
 - 只监听本机 `127.0.0.1`，需要本地随机密钥；不安装登录自启。
 - **macOS 已完成真实 Claude Code / Codex 改文件、运行测试和续聊验证。** Linux 使用相同脚本但尚未做真实客户端验收；Windows 提供 Python 启动方式，尚未做完整验收。
 
-这不是 Notion 官方 API，也不是原生 Claude API。工具调用通过 JSON 桥接实现；不支持图片、Notion 内部工具审批或 Codex 外部插件工具。模型能否使用、账号额度及限流以当前 Notion workspace 为准。
+这不是 Notion 官方 API，也不是原生 Claude API。工具调用通过 JSON 桥接实现；暂不支持图片 URL、PDF 等文档附件、Responses 图片、Notion 内部工具审批或 Codex 外部插件工具。模型能否使用、账号额度及限流以当前 Notion workspace 为准。
 
 ## 1. Clone 并安装依赖
 
@@ -152,9 +152,9 @@ notion-proxy --profile team
 notion-proxy
 ```
 
-- 每个 profile 单独保存登录信息和会话状态。默认一个代理进程只用一个 profile；加 `--failover` 后，额度用完时会自动切换（见下文）。
+- 每个 profile 单独保存登录信息和会话状态。默认自动加载已保存的备用 profile，额度用完时自动切换；模型权限不符或重复 workspace 会跳过。使用 `--failover ''` 可关闭自动切换。
 - 同一个账号的不同 workspace 要分别检查模型权限。无权使用时会报错，不会自动回退到其他模型。
-- **切换 workspace 后请新建客户端对话。恢复旧对话前，先启动它原来的 profile。** 客户端会把对话历史发给当前连接的 workspace，代理不会跨 workspace 迁移远端聊天，也不会替你自动选择旧空间。
+- 手动改变主 profile 后，建议新建客户端对话；自动切换备用 workspace 时可继续原对话，代理会把最近的客户端历史带到新空间。
 - 使用相同 profile 续聊、重启或刷新登录，原会话绑定会保留。若 profile 的账号/workspace 发生变化，会使用独立的绑定命名空间。
 
 ### 新 thread 首轮输入上限
@@ -167,11 +167,13 @@ notion-proxy
 
 ### 额度用完自动切换 workspace
 
+默认 `notion-proxy` 会扫描已保存的 profile：主 profile 优先，其他 profile 按名称排序，启动时验证模型权限并去重。新增 profile 后需重启代理。`/health` 的 `workspaces` 列表可查看已加载和跳过的空间；`available` 表示未在冷却期，并非实时余额查询。也可显式限定备用列表：
+
 ```sh
 notion-proxy --profile default --failover team,team2
 ```
 
-（也可以设置环境变量 `NOTION_GATEWAY_FAILOVER_PROFILES=team,team2`。）
+（也可以设置环境变量 `NOTION_GATEWAY_FAILOVER_PROFILES=team,team2`；命令行参数优先。`--failover ''` 仅使用主 profile。）
 
 - 当前 workspace 返回 429 或额度用完时，代理会自动换到下一个 profile，同一个客户端对话继续进行，不需要新建。
 - 切换的那一轮只把最近一段客户端历史（默认 60000 个 JSON 转义后的 UTF-8 字节，`NOTION_GATEWAY_FAILOVER_SEED_CHARS`，同时受首轮和单次发送预算限制）带到新 workspace 的新 thread，之后照常只发增量。

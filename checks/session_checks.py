@@ -2,6 +2,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 from app.agent_gateway.protocol import prepare_request
 from app.agent_gateway.sessions import SessionStore, client_session, incremental_prompt, is_away_summary
@@ -197,6 +198,90 @@ class SessionChecks(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.up.writes), 1)
         self.assertEqual(len(self.up.polls), 2)
 
+    async def test_failed_dispatch_recovers_on_same_thread_after_restart_with_same_event(self):
+        _, first = await self.run_turn()
+        messages = self.first + [{'role': 'assistant', 'content': 'OK'}, {'role': 'user', 'content': 'Next'}]
+        start = self.up.start_turn
+        self.up.start_turn = AsyncMock(side_effect=UpstreamError('POST returned HTTP 502'))
+        with self.assertRaises(UpstreamError):
+            await self.run_turn(messages=messages)
+        failed = self.store.get('one')
+        self.assertFalse(failed['pending']['dispatch_accepted'])
+        event_id = failed['pending']['event_id']
+        self.store.close()
+        self.store = SessionStore(self.path)
+        self.up.start_turn = AsyncMock(side_effect=start)
+        self.up.turn_is_absent = AsyncMock(return_value=True)
+        _, info = await self.run_turn(messages=messages)
+        self.assertEqual(info['thread_id'], first['thread_id'])
+        self.assertEqual(self.up.start_turn.call_args.args[3], event_id)
+        self.assertEqual(info['history_mode'], 'append')
+        self.assertTrue(info['recovered_unsent'])
+        self.assertEqual(len(self.up.writes), 2)
+        self.assertNotIn('pending', self.store.get('one'))
+
+    async def test_legacy_unsent_pending_allows_changed_request_without_drain_or_stale_output(self):
+        _, first = await self.run_turn()
+        start = self.up.start_turn
+        self.up.start_turn = AsyncMock(side_effect=UpstreamError('POST interrupted'))
+        with self.assertRaises(UpstreamError):
+            await self.run_turn(messages=self.first + [{'role': 'user', 'content': 'Not sent'}])
+        record = self.store.get('one')
+        for field in ('dispatch_accepted', 'submitted_at'):
+            record['pending'].pop(field)
+        self.store.save('one', record)
+        self.up.start_turn = AsyncMock(side_effect=start)
+        self.up.turn_is_absent = AsyncMock(return_value=True)
+        _, info = await self.run_turn(messages=self.first + [{'role': 'user', 'content': 'Current request'}])
+        self.assertEqual(info['thread_id'], first['thread_id'])
+        self.assertTrue(info['recovered_unsent'])
+        self.assertEqual(len(self.up.polls), 2)
+        self.assertNotIn('Not sent', self.up.writes[-1][2])
+        self.assertIn('Current request', self.up.writes[-1][2])
+        self.assertNotIn('Remember violet', self.up.writes[-1][2])
+
+    async def test_acknowledged_timeout_is_never_resubmitted_even_if_remote_looks_idle(self):
+        await self.run_turn()
+        self.up.timeout = True
+        messages = self.first + [{'role': 'user', 'content': 'Next'}]
+        with self.assertRaises(TimeoutError):
+            await self.run_turn(messages=messages)
+        self.assertTrue(self.store.get('one')['pending']['dispatch_accepted'])
+        self.up.turn_is_absent = AsyncMock(return_value=True)
+        self.up.timeout = False
+        await self.run_turn(messages=messages)
+        self.up.turn_is_absent.assert_not_awaited()
+        self.assertEqual(len(self.up.writes), 2)
+
+    async def test_unknown_dispatch_with_remote_activity_only_polls_without_resubmitting(self):
+        await self.run_turn()
+        start = self.up.start_turn
+        self.up.start_turn = AsyncMock(side_effect=UpstreamError('response lost'))
+        messages = self.first + [{'role': 'user', 'content': 'Next'}]
+        with self.assertRaises(UpstreamError):
+            await self.run_turn(messages=messages)
+        self.up.start_turn = AsyncMock(side_effect=start)
+        self.up.turn_is_absent = AsyncMock(return_value=False)
+        await self.run_turn(messages=messages)
+        self.up.start_turn.assert_not_awaited()
+        self.assertEqual(len(self.up.polls), 2)
+
+    async def test_failed_reconciliation_read_preserves_pending_and_workspace(self):
+        a, b = ScopedNotion('a'), ScopedNotion('b')
+        pool = WorkspacePool([('a', a), ('b', b)])
+        await pool.run(self.store, 'one', prompt(self.first), 'medium', json.loads)
+        a.start_turn = AsyncMock(side_effect=UpstreamError('write failed'))
+        messages = self.first + [{'role': 'user', 'content': 'Next'}]
+        with self.assertRaises(UpstreamError):
+            await pool.run(self.store, 'one', prompt(messages), 'medium', json.loads)
+        original = self.store.get('one')
+        a.turn_is_absent = AsyncMock(side_effect=UpstreamError('read failed'))
+        with self.assertRaises(UpstreamError):
+            await pool.run(self.store, 'one', prompt(messages), 'medium', json.loads)
+        self.assertEqual(self.store.get('one'), original)
+        self.assertEqual(pool.cooling, {})
+        self.assertEqual(b.writes, [])
+
     async def test_pending_different_request_drains_and_continues_same_thread(self):
         self.up.timeout = True
         with self.assertRaises(TimeoutError):
@@ -364,6 +449,53 @@ class SessionChecks(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first["thread_id"], second["thread_id"])
         self.assertEqual(second["history_mode"], "resync")
         self.assertIn('"mode":"resync"', self.up.writes[1][2])
+
+    async def test_desktop_retry_marker_revision_only_sends_changed_tail(self):
+        messages = [{'role': 'user', 'content': 'Earlier task ' + 'x' * 100000},
+                    {'role': 'assistant', 'content': 'Earlier answer'},
+                    {'role': 'user', 'content': 'Current task'},
+                    {'role': 'user', 'content': '[Request interrupted]'}]
+        _, first = await self.run_turn(messages=messages)
+        changed = messages[:-1] + [{'role': 'user', 'content': '[Request interrupted by user]'},
+                                   {'role': 'user', 'content': 'Only read package.json'}]
+        _, second = await self.run_turn(messages=changed)
+        sent = self.up.writes[-1][2]
+        payload = json.loads(sent.split('CLIENT_CONTEXT_JSON:\n', 1)[1])
+        self.assertEqual(first['thread_id'], second['thread_id'])
+        self.assertEqual(payload['mode'], 'resync')
+        self.assertEqual(payload['unchanged_prefix_items'], 3)
+        self.assertEqual(second['omitted_earlier_items'], 0)
+        self.assertNotIn('Earlier task', sent)
+        self.assertIn('Only read package.json', sent)
+        self.assertLess(len(sent), 3000)
+
+    def test_revised_tool_result_keeps_entire_tool_turn(self):
+        tool = {'name': 'Read', 'input_schema': {'type': 'object'}}
+        messages = [{'role': 'user', 'content': 'Earlier'}, {'role': 'assistant', 'content': 'Done'},
+                    {'role': 'user', 'content': 'Read file'},
+                    {'role': 'assistant', 'content': [{'type': 'tool_use', 'id': 'call', 'name': 'Read', 'input': {}}]},
+                    {'role': 'user', 'content': [{'type': 'tool_result', 'tool_use_id': 'call', 'content': 'Before'}]}]
+        _, snapshot, _, _ = incremental_prompt(prompt(messages, tools=[tool]), {})
+        changed = messages[:-1] + [{'role': 'user', 'content': [
+            {'type': 'tool_result', 'tool_use_id': 'call', 'content': 'After'}]}]
+        sent, _, _, _ = incremental_prompt(prompt(changed, tools=[tool]), {'snapshot': snapshot})
+        payload = json.loads(sent.split('CLIENT_CONTEXT_JSON:\n', 1)[1])
+        self.assertEqual(payload['unchanged_prefix_items'], 2)
+        self.assertIn('Read file', sent)
+        self.assertIn('"tool_use"', sent)
+        self.assertIn('After', sent)
+        self.assertNotIn('Earlier', sent)
+
+    def test_history_revision_at_first_message_resends_full_history(self):
+        original = [{'role': 'user', 'content': 'Before'}, {'role': 'assistant', 'content': 'Done'},
+                    {'role': 'user', 'content': 'Last'}]
+        _, snapshot, _, _ = incremental_prompt(prompt(original), {})
+        sent, _, _, _ = incremental_prompt(prompt([{'role': 'user', 'content': 'After'}] + original[1:]),
+                                            {'snapshot': snapshot})
+        payload = json.loads(sent.split('CLIENT_CONTEXT_JSON:\n', 1)[1])
+        self.assertNotIn('unchanged_prefix_items', payload)
+        self.assertIn('After', sent)
+        self.assertIn('Last', sent)
 
     def test_headers_metadata_fallback_and_agent_isolation(self):
         a, source = client_session({"X-Claude-Code-Session-Id": "a"}, {}, "messages")

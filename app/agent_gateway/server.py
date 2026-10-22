@@ -19,7 +19,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from .protocol import (ProtocolError, prepare_request, parse_answer, estimate_tokens, sse, content_events,
-                       answer_options, finalize_answer, leading_text, auto_mode_verdict)
+                       answer_options, finalize_answer, auto_mode_verdict)
 from .upstream import NotionAgent, UpstreamError, PUBLIC_MODEL
 from .responses import PICKER_MODEL, convert_request, convert_answer, response_object, output_events, response_usage
 from .routing import passthrough, HOP_HEADERS
@@ -27,7 +27,7 @@ from .sessions import SessionStore, client_session, is_away_summary
 from .config import ROOT, LOCAL, PROFILE, PROFILE_LOCAL, PROFILES, CATALOG, profile_path
 from .pool import WorkspacePool
 
-# Raw body bound only; base64 media is reduced to text markers before the payload is built.
+# Raw body bound; images travel as native attachments outside the text payload.
 MAX_REQUEST_BYTES = int(os.getenv("NOTION_GATEWAY_MAX_REQUEST_BYTES", "128000000"))
 
 
@@ -160,7 +160,7 @@ async def messages(request: Request):
     except ProtocolError as exc:
         return error_response(str(exc))
     except (ValueError, TypeError, KeyError, AttributeError):
-        return error_response("Invalid or unsupported Messages request; text and custom tools only")
+        return error_response("Invalid or unsupported Messages request; supported: text, images and custom tools")
     message_id = "msg_" + uuid.uuid4().hex
     usage = {"input_tokens": estimate_tokens(prompt), "output_tokens": 0}
     message = {"id": message_id, "type": "message", "role": "assistant", "model": body["model"],
@@ -216,7 +216,8 @@ async def messages(request: Request):
             return result
         except BaseException as exc:
             audit({"id": message_id, "event": "failed", "error_class": type(exc).__name__,
-                   **(exc.diagnostics if isinstance(exc, UpstreamError) else {})})
+                   "session_hash": session_key, "duration_s": round(time.monotonic() - started, 2),
+                   "error_status": getattr(exc, "status", 502), **getattr(exc, "diagnostics", {})})
             raise
 
     headers = {"x-notion-usage-estimated": "true", "x-notion-tool-mode": "text-json-bridge"}
@@ -227,46 +228,17 @@ async def messages(request: Request):
             return error_response(str(exc) or "Notion turn timed out", getattr(exc, "status", 502))
 
     async def stream():
-        updates = asyncio.Queue()
-        # Emulated stop sequences / schemas rewrite the text, so only stream plain answers live.
-        live = not options["stop_sequences"] and options["schema"] is None
-        task = asyncio.create_task(execute((lambda partial: updates.put_nowait(partial)) if live else None))
-        streamed = ""
-        getter = None
+        # The JSON bridge can need protocol correction. Keep partial prose private
+        # until the complete answer (including every tool argument) validates.
+        task = asyncio.create_task(execute())
         try:
             yield sse("message_start", message=message)
             while not task.done():
-                # Reuse one pending get() across pings so no orphaned waiter is left behind on disconnect.
-                if getter is None:
-                    getter = asyncio.ensure_future(updates.get())
-                finished, _ = await asyncio.wait({task, getter}, timeout=5, return_when=asyncio.FIRST_COMPLETED)
-                if getter not in finished:
-                    if not finished:
-                        yield sse("ping")
-                    continue
-                partial, getter = getter.result(), None
-                while not updates.empty():
-                    partial = updates.get_nowait()
-                text = leading_text(partial)
-                if len(text) > len(streamed) and text.startswith(streamed):
-                    if not streamed:
-                        yield sse("content_block_start", index=0, content_block={"type": "text", "text": ""})
-                    yield sse("content_block_delta", index=0, delta={"type": "text_delta", "text": text[len(streamed):]})
-                    streamed = text
+                finished, _ = await asyncio.wait({task}, timeout=5)
+                if not finished:
+                    yield sse("ping")
             result = task.result()
-            content, start = result["content"], 0
-            if streamed:
-                # Only the leading text is streamed early; tool input is still validated before exposure.
-                first = content[0] if content else None
-                if first and first["type"] == "text" and first["text"].startswith(streamed):
-                    if first["text"][len(streamed):]:
-                        yield sse("content_block_delta", index=0,
-                                  delta={"type": "text_delta", "text": first["text"][len(streamed):]})
-                    content = content[1:]
-                yield sse("content_block_stop", index=0)
-                start = 1
-            # Buffer and validate the complete JSON before exposing executable tool input.
-            for event in content_events(content, start):
+            for event in content_events(result["content"]):
                 yield event
             yield sse("message_delta", delta={"stop_reason": result["stop_reason"],
                                               "stop_sequence": result.get("stop_sequence")},
@@ -276,13 +248,10 @@ async def messages(request: Request):
             yield sse("error", error={"type": error_type(getattr(exc, "status", 502)),
                                       "message": str(exc) or "Notion turn timed out"})
         finally:
-            pending = [t for t in (task, getter) if t is not None and not t.done()]
-            for t in pending:
-                t.cancel()
+            if not task.done():
+                task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
-                await asyncio.gather(*pending, return_exceptions=True)
-            if task.done() and not task.cancelled():
-                task.exception()
+                await task
 
     return StreamingResponse(stream(), media_type="text/event-stream",
                              headers={**headers, "cache-control": "no-cache", "x-accel-buffering": "no"})
@@ -374,7 +343,9 @@ async def responses(request: Request):
                    "input_chars": len(prompt), "tools": [x["name"] for x in result["output"] if x["type"] != "message"]})
             return result
         except BaseException as exc:
-            audit({"id": response_id, "event": "failed", "error_class": type(exc).__name__, "protocol": "responses"})
+            audit({"id": response_id, "event": "failed", "error_class": type(exc).__name__, "protocol": "responses",
+                   "session_hash": session_key, "duration_s": round(time.monotonic() - started, 2),
+                   "error_status": getattr(exc, "status", 502), **getattr(exc, "diagnostics", {})})
             raise
 
     if not body.get("stream", False):

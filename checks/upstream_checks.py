@@ -2,11 +2,46 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import AsyncMock, patch
 import httpx
 from app.agent_gateway.upstream import NotionAgent, UpstreamError
 
 
 class UpstreamChecks(unittest.IsolatedAsyncioTestCase):
+    async def test_absent_turn_requires_repeated_explicit_idle_checkpoint(self):
+        agent = object.__new__(NotionAgent)
+        agent.space_id = 's'
+        idle = {'session': {'status': 'idle', 'sequence': 10}, 'session_pending': False,
+                'forward_after_sequence': 10, 'has_more_forward': False, 'patches': []}
+        agent.post = AsyncMock(return_value=idle)
+        with patch('app.agent_gateway.upstream.asyncio.sleep', new_callable=AsyncMock):
+            self.assertTrue(await agent.turn_is_absent('thread', 'cursor', 10, 'prior'))
+        self.assertEqual(agent.post.await_count, 3)
+        self.assertTrue(all(call.args[1]['cursor'] == 'cursor' for call in agent.post.await_args_list))
+        for changed in (
+            {**idle, 'session_pending': True},
+            {**idle, 'session_pending': None},
+            {**idle, 'session': {'status': 'running', 'sequence': 10}},
+            {**idle, 'session': {'status': 'idle', 'sequence': 11}},
+            {**idle, 'forward_after_sequence': 11},
+            {**idle, 'has_more_forward': True},
+            {**idle, 'patches': [{'op': 'put', 'entity': {'kind': 'user_message', 'sequence': 11}}]},
+            {},
+        ):
+            with self.subTest(page=changed):
+                agent.post = AsyncMock(side_effect=[idle, changed])
+                with patch('app.agent_gateway.upstream.asyncio.sleep', new_callable=AsyncMock):
+                    self.assertFalse(await agent.turn_is_absent('thread', 'cursor', 10, 'prior'))
+
+    async def test_absent_turn_cannot_infer_rejection_from_missing_thread_or_failed_read(self):
+        agent = object.__new__(NotionAgent)
+        agent.space_id = 's'
+        agent.post = AsyncMock(side_effect=UpstreamError('read failed'))
+        self.assertFalse(await agent.turn_is_absent('thread', None, -1, None))
+        agent.post.assert_not_awaited()
+        with self.assertRaises(UpstreamError):
+            await agent.turn_is_absent('thread', 'cursor', 10, 'prior')
+
     async def test_terminal_failure_exposes_cursor_for_same_thread_recovery(self):
         with tempfile.TemporaryDirectory() as tmp:
             session = Path(tmp) / 'session.json'

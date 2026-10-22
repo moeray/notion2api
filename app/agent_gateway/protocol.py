@@ -10,6 +10,7 @@ from jsonschema import Draft202012Validator, SchemaError
 from referencing import Registry
 
 from .upstream import PUBLIC_MODEL
+from .media import ImageError, ImagePrompt, normalize_image
 
 # Full client context bound; the per-turn upstream payload is bounded separately in sessions.py.
 MAX_INPUT_CHARS = int(os.getenv("NOTION_GATEWAY_MAX_INPUT_CHARS", "4000000"))
@@ -28,6 +29,17 @@ class ProtocolError(Exception):
     pass
 
 
+class AnswerError(ProtocolError):
+    """Invalid model output, safe to correct before any local action is delivered."""
+
+    status = 502
+
+    def __init__(self, message, code="invalid_answer", repair=None):
+        super().__init__(message)
+        self.diagnostics = {"error_code": code}
+        self.repair = repair or {}
+
+
 def media_placeholder(block):
     source = block.get("source") if isinstance(block.get("source"), dict) else {}
     kind = block.get("type")
@@ -35,10 +47,11 @@ def media_placeholder(block):
     data = source.get("data")
     size = f", ~{len(data) * 3 // 4 // 1024}KB" if isinstance(data, str) else ""
     title = f" {block['title']!r}" if isinstance(block.get("title"), str) else ""
-    return f"[{kind}{title} ({media}{size}) omitted: this bridge is text-only]"
+    return f"[{kind}{title} ({media}{size}) omitted: document attachments are not supported]"
 
 
-def normalize_content(content, role):
+def normalize_content(content, role, images=None):
+    images = {} if images is None else images
     if isinstance(content, str):
         return [{"type": "text", "text": content}]
     if not isinstance(content, list):
@@ -56,16 +69,20 @@ def normalize_content(content, role):
             if not isinstance(block.get("tool_use_id"), str):
                 raise ProtocolError("tool_result requires tool_use_id")
             result.append({"type": kind, "tool_use_id": block["tool_use_id"],
-                           "content": normalize_content(block.get("content", ""), "tool_result"),
+                           "content": normalize_content(block.get("content", ""), "tool_result", images),
                            "is_error": bool(block.get("is_error", False))})
         elif kind in {"thinking", "redacted_thinking"} and role == "assistant":
             # Thinking from another provider cannot be replayed to Notion; drop it.
             continue
-        elif kind in {"image", "document"} and role != "assistant":
-            # The bridge is text-only; base64 media would only bloat history, so keep a short marker.
+        elif kind == "image" and role in {"user", "tool_result"}:
+            try:
+                result.append(normalize_image(block, images))
+            except ImageError as exc:
+                raise ProtocolError(str(exc)) from None
+        elif kind == "document" and role != "assistant":
             result.append({"type": "text", "text": media_placeholder(block)})
         else:
-            raise ProtocolError(f"Unsupported content block {kind!r}; this gateway supports text and local tools only")
+            raise ProtocolError(f"Unsupported content block {kind!r}; supported: text, images and local tools")
     return result
 
 
@@ -92,7 +109,8 @@ def finalize_answer(content: list, stop: str, options: dict):
     if options["schema"] is not None:
         texts = [b for b in content if b["type"] == "text"]
         if stop == "tool_use" or len(texts) != 1:
-            raise ProtocolError("Structured output requires exactly one text block")
+            raise AnswerError("Structured output requires exactly one text block",
+                              repair={"output_json_schema": options["schema"]})
         raw = texts[0]["text"].strip()
         if raw.startswith("```"):
             raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
@@ -100,7 +118,8 @@ def finalize_answer(content: list, stop: str, options: dict):
             value = json.loads(raw)
             Draft202012Validator(options["schema"], registry=Registry()).validate(value)
         except Exception:
-            raise ProtocolError("Structured output does not match the requested schema") from None
+            raise AnswerError("Structured output does not match the requested schema",
+                              repair={"output_json_schema": options["schema"]}) from None
         return [{"type": "text", "text": json.dumps(value, ensure_ascii=False)}], "end_turn", None
     if options["stop_sequences"] and stop != "tool_use":
         output = []
@@ -167,13 +186,13 @@ def prepare_request(body: dict):
             raise ProtocolError("Invalid tool JSON schema") from None
         tools[name] = {"name": name, "description": short_description(tool.get("description", "")),
                        "input_schema": tool["input_schema"]}
-    messages = []
+    messages, images = [], {}
     pending = set()
     for msg in body.get("messages", []):
         role = msg.get("role")
         if role not in {"user", "assistant", "system"}:
             raise ProtocolError("Unsupported message role")
-        blocks = normalize_content(msg.get("content"), role)
+        blocks = normalize_content(msg.get("content"), role, images)
         for block in blocks:
             if block["type"] == "tool_use":
                 if block["id"] in pending:
@@ -221,7 +240,7 @@ def prepare_request(body: dict):
     )
     if len(prompt) > MAX_INPUT_CHARS:
         raise ProtocolError(f"Context length {len(prompt)} exceeds the local gateway's {MAX_INPUT_CHARS}-character limit; compact the conversation")
-    return prompt, tools, choice, effort
+    return ImagePrompt(prompt, images) if images else prompt, tools, choice, effort
 
 
 def parse_answer(text: str, tools: dict, choice: dict):
@@ -231,36 +250,42 @@ def parse_answer(text: str, tools: dict, choice: dict):
     try:
         value = json.loads(text)
     except ValueError:
-        raise ProtocolError("Notion did not return the required JSON envelope; no tools were executed") from None
+        raise AnswerError("Notion did not return the required JSON envelope; no tools were executed",
+                          "invalid_json") from None
     blocks = value.get("content") if isinstance(value, dict) else None
     if not isinstance(blocks, list) or not 1 <= len(blocks) <= 32:
-        raise ProtocolError("Invalid content envelope")
+        raise AnswerError("Invalid content envelope")
     output = []
     for block in blocks:
         if not isinstance(block, dict):
-            raise ProtocolError("Invalid content block")
+            raise AnswerError("Invalid content block")
         if block.get("type") == "text" and isinstance(block.get("text"), str):
             output.append({"type": "text", "text": block["text"]})
         elif block.get("type") == "tool_use":
             name, args = block.get("name"), block.get("input")
             if name not in tools or not isinstance(args, dict):
-                raise ProtocolError("Unknown tool or invalid tool arguments; no tools were executed")
+                raise AnswerError("Unknown tool or invalid tool arguments; no tools were executed",
+                                  "invalid_tool", {"allowed_tool_names": list(tools)})
             try:
                 Draft202012Validator(tools[name]["input_schema"], registry=Registry()).validate(args)
-            except Exception:
-                raise ProtocolError("Tool arguments do not match the provided schema; no tools were executed") from None
+            except Exception as exc:
+                raise AnswerError("Tool arguments do not match the provided schema; no tools were executed",
+                                  "invalid_tool_arguments",
+                                  {"tool": name, "input_schema": tools[name]["input_schema"],
+                                   "invalid_path": list(getattr(exc, "absolute_path", [])),
+                                   "constraint": getattr(exc, "validator", None)}) from None
             output.append({"type": "tool_use", "id": "toolu_" + uuid.uuid4().hex, "name": name, "input": args})
         else:
-            raise ProtocolError("Unsupported model response block")
+            raise AnswerError("Unsupported model response block")
     calls = [b for b in output if b["type"] == "tool_use"]
     if choice["type"] == "none" and calls:
-        raise ProtocolError("Model ignored tool_choice=none")
+        raise AnswerError("Model ignored tool_choice=none", repair={"tool_choice": choice})
     if choice["type"] in {"any", "tool"} and not calls:
-        raise ProtocolError("Model did not call the requested tool")
+        raise AnswerError("Model did not call the requested tool", repair={"tool_choice": choice})
     if choice["type"] == "tool" and any(b["name"] != choice["name"] for b in calls):
-        raise ProtocolError("Model selected the wrong tool")
+        raise AnswerError("Model selected the wrong tool", repair={"tool_choice": choice})
     if choice.get("disable_parallel_tool_use") and len(calls) > 1:
-        raise ProtocolError("Model returned parallel tool calls when disabled")
+        raise AnswerError("Model returned parallel tool calls when disabled", repair={"tool_choice": choice})
     return output, "tool_use" if calls else "end_turn"
 
 

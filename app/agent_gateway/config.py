@@ -16,9 +16,24 @@ def profile_path(name):
 
 PROFILE = os.getenv("NOTION_GATEWAY_PROFILE", "default")
 PROFILE_LOCAL = profile_path(PROFILE)
+
+
+def configured_profiles(primary, failover=None):
+    """Auto-discover saved profiles unless an explicit list (including empty) is given."""
+    profile_path(primary)
+    if failover is None or failover.strip() == "auto":
+        names = ["default"] if (LOCAL / "notion-session.json").is_file() else []
+        names += [p.parent.name for p in sorted((LOCAL / "profiles").glob("*/notion-session.json"))]
+        names = [n for n in names if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", n)]
+    else:
+        names = [n.strip() for n in failover.split(",") if n.strip()]
+        for name in names:
+            profile_path(name)
+    return list(dict.fromkeys([primary, *names]))
+
+
 # Workspaces to continue in, in order, when the active one runs out of quota.
-FAILOVER = [n.strip() for n in os.getenv("NOTION_GATEWAY_FAILOVER_PROFILES", "").split(",") if n.strip()]
-PROFILES = list(dict.fromkeys([PROFILE, *FAILOVER]))
+PROFILES = configured_profiles(PROFILE, os.getenv("NOTION_GATEWAY_FAILOVER_PROFILES"))
 
 
 def venv_python():
