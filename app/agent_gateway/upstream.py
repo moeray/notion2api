@@ -11,6 +11,20 @@ from collections import OrderedDict
 from pathlib import Path
 from urllib.parse import urlsplit
 
+# PATCHED-BY-OPS: httpx's TLS fingerprint is rejected by Notion's edge for the
+# agent endpoints (createAgentThread answers 400 UserValidationError while the
+# low-risk getAvailableModels passes). curl_cffi impersonates Chrome's TLS/JA3
+# and the same request returns 200. Keep the dependency optional at import time
+# so the module still loads where curl_cffi is absent.
+try:
+    from curl_cffi.requests import AsyncSession
+    from curl_cffi.requests.errors import RequestsError
+    _HAS_CURL_CFFI = True
+except Exception:  # pragma: no cover - fallback keeps the old transport usable
+    AsyncSession = None
+    RequestsError = Exception
+    _HAS_CURL_CFFI = False
+
 import httpx
 
 from .media import FilePrompt, IMAGE_EXTENSIONS
@@ -148,31 +162,61 @@ class NotionAgent:
         headers.update({"origin": config["origin"], "referer": config["origin"] + "/chat",
                         "x-notion-space-id": self.space_id,
                         "x-notion-active-user-header": config["user_id"]})
-        self.client = httpx.AsyncClient(
-            base_url=config["origin"], headers=headers,
-            cookies={c["name"]: c["value"] for c in config["cookies"]},
-            timeout=httpx.Timeout(40, connect=15), follow_redirects=False,
-        )
+        self.base_url = config["origin"]
+        if _HAS_CURL_CFFI:
+            # Chrome TLS/JA3 fingerprint; httpx gets a 400 from Notion's edge.
+            self.client = AsyncSession(
+                impersonate="chrome", headers=headers,
+                cookies={c["name"]: c["value"] for c in config["cookies"]},
+                timeout=40, allow_redirects=False,
+            )
+        else:
+            self.client = httpx.AsyncClient(
+                base_url=config["origin"], headers=headers,
+                cookies={c["name"]: c["value"] for c in config["cookies"]},
+                timeout=httpx.Timeout(40, connect=15), follow_redirects=False,
+            )
 
     async def close(self):
-        await self.client.aclose()
+        if _HAS_CURL_CFFI:
+            await self.client.close()
+        else:
+            await self.client.aclose()
 
     async def post(self, endpoint: str, body: dict):
+        url = self.base_url + "/api/v3/" + endpoint
+        read_only = endpoint in {"getThreadTranscript", "getAvailableModels", "getCreditRateLimitStatus"}
         # Read-only requests are safe to retry. Writes require session-level
         # reconciliation; never replay a generation POST because its response broke.
-        attempts = 3 if endpoint in {"getThreadTranscript", "getAvailableModels", "getCreditRateLimitStatus"} else 1
+        # PATCHED-BY-OPS: a 429 is a rate limit, not a broken response - the turn
+        # was never accepted, so a short backoff-and-retry is safe even for writes.
+        attempts = 4 if read_only else 2
         for attempt in range(attempts):
             try:
-                response = await self.client.post("/api/v3/" + endpoint, json=body)
-            except httpx.HTTPError as exc:
-                if attempt + 1 < attempts:
+                if _HAS_CURL_CFFI:
+                    response = await self.client.post(url, json=body)
+                else:
+                    response = await self.client.post("/api/v3/" + endpoint, json=body)
+            except (RequestsError, httpx.HTTPError) as exc:
+                if read_only and attempt + 1 < attempts:
                     await asyncio.sleep(0.5 * (2 ** attempt))
                     continue
                 error = UpstreamError("Notion transport failed (" + type(exc).__name__ + ")")
-                error.diagnostics = {"upstream_endpoint": endpoint, "transport_error": type(exc).__name__,
+                error.diagnostics = {"upstream_endpoint": endpoint,
+                                     "transport_error": type(exc).__name__,
                                      "read_attempts": attempt + 1}
                 raise error from None
-            if response.status_code in {408, 500, 502, 503, 504} and attempt + 1 < attempts:
+            # PATCHED-BY-OPS: Notion's short-window throttle answers 429 with a
+            # billing-period retryAfter that is useless for a live turn. Back
+            # off briefly (5s, 10s) and retry instead of failing the request -
+            # this is what keeps a large multi-chunk turn alive.
+            if response.status_code == 429 and attempt + 1 < attempts:
+                wait = 5 * (2 ** attempt)
+                print("[rate-limit] %s 429, retry %d/%d in %ds"
+                      % (endpoint, attempt + 1, attempts - 1, wait), flush=True)
+                await asyncio.sleep(wait)
+                continue
+            if response.status_code in {408, 500, 502, 503, 504} and read_only and attempt + 1 < attempts:
                 await asyncio.sleep(0.5 * (2 ** attempt))
                 continue
             break
@@ -189,6 +233,14 @@ class NotionAgent:
             if not isinstance(detail, dict):
                 detail = {}
             debug = detail.get("debugMessage", "")
+            # DEBUG-BY-OPS: keep the rejected upstream body on disk so a 400 can
+            # be diagnosed locally (the shipped code deliberately hides it).
+            try:
+                with open(os.path.join(os.path.dirname(__file__), "..", "..", ".local",
+                                       "upstream-errors.log"), "a", encoding="utf-8") as _fh:
+                    _fh.write("%s %s %s\n" % (endpoint, response.status_code, response.text[:1500]))
+            except Exception:
+                pass
             # A larger UTF-8 prompt may pass character limits but overflow Notion's
             # internal duplicated DynamoDB write. Do not expose arbitrary error text.
             if response.status_code == 400 and isinstance(debug, str) and re.fullmatch(
@@ -196,7 +248,7 @@ class NotionAgent:
                 error.status = 413
                 error.args = ("Notion rejected an oversized UTF-8 context; compact the conversation or split the input",)
             error.diagnostics = {"upstream_endpoint": endpoint, "upstream_status": response.status_code,
-                                 "request_bytes": len(response.request.content),
+                                 "request_bytes": len(json.dumps(body).encode("utf-8")),
                                  "reasoning_effort": body.get("reasoningEffort")}
             for field in ("name", "errorId"):
                 value = detail.get(field)
@@ -217,26 +269,59 @@ class NotionAgent:
             raise UpstreamError("Notion model mapping changed; refusing an unverified model")
         return {"id": PUBLIC_MODEL, "upstream_id": MODEL, "name": model["modelMessage"]}
 
-    async def start_turn(self, prompt, effort, thread_id, event_id, continuation=False):
+    async def start_turn(self, prompt, effort, thread_id, event_id, continuation=False, model=None):
+        # PATCHED-BY-OPS: `model` carries the upstream id resolved from the
+        # client's slug (see model_map.py). None keeps the historical behaviour
+        # of always using the built-in default.
+        # AUTO-BY-OPS: `model == "auto"` means "let Notion pick" - the thread is
+        # created without model/reasoningEffort and follow-up turns omit
+        # modelSelection entirely. Used by the `notion-auto` logical model, which
+        # keeps working when the explicit paid models are out of AI credits.
+        auto = str(model or "").lower() == "auto"
         content = [{"type": "text", "text": [[str(prompt)]]}]
         content.extend({"type": "file", "file_id": file_id} for file_id in getattr(prompt, "file_ids", []))
         if continuation:
-            # Model selection belongs to thread creation. Adding modelSelection here
-            # was rejected by the actual Notion endpoint; preserve the thread's model.
-            await self.post("sendEventToAgentThread", {
+            # PATCHED-BY-OPS: a web capture of an AUTO follow-up (2026-10-21)
+            # shows the real client sends NO modelSelection at all:
+            #   {spaceId, threadId, event, surface, clientEventId}
+            # Our earlier {"type":"auto"} guess is invalid and earned
+            # 400 ValidationError "Invalid input." on every second turn.
+            # An explicit model still pins the turn (verified capture).
+            reply = {
                 "spaceId": self.space_id, "threadId": thread_id,
                 "event": {"type": "user.message", "content": content},
                 "surface": "full_page_chat", "clientEventId": event_id,
-            })
+            }
+            if not auto:
+                reply["modelSelection"] = {"type": "explicit", "model": model or MODEL,
+                                           "reasoningEffort": effort}
+            await self.post("sendEventToAgentThread", reply)
         else:
-            await self.post("createAgentThread", {
+            # PATCHED-BY-OPS: a real web capture (2026-10-20, max effort) uses
+            # TOP-LEVEL model/reasoningEffort here; with the curl_cffi transport
+            # it sticks and agent_provider comes back albuquerque-quinn / max.
+            # The 400 that pushed the author to `modelSelection` was the httpx
+            # TLS fingerprint, not the field names.
+            body = {
                 "type": "personal_agent", "spaceId": self.space_id, "threadId": thread_id,
-                "enableSuggestedEditsTools": False, "model": MODEL, "reasoningEffort": effort,
+                "enableSuggestedEditsTools": True,
                 "createdSource": "full_page_chat", "content": content,
                 "policies": {"approval_mode": "review_for_me"},
-                "agentMemorySettings": {"useMemories": False, "excludeChatFromMemories": True},
+                "agentMemorySettings": {"useMemories": True, "excludeChatFromMemories": False},
                 "browserEnabled": False, "clientMessageId": event_id,
-            })
+            }
+            if not auto:
+                body["model"] = model or MODEL
+                body["reasoningEffort"] = effort
+            reply = await self.post("createAgentThread", body)
+            if auto:
+                # The response names the model Notion actually picked; without
+                # this line an auto thread gives no visibility into what ran.
+                provider = ((reply or {}).get("thread") or {}).get("data", {}).get("agent_provider") or {}
+                if provider.get("model"):
+                    print("[notion-auto] upstream picked model=%s effort=%s"
+                          % (provider.get("model"), provider.get("reasoningEffort")),
+                          flush=True)
 
     async def prepare_images(self, prompt, thread_id, continuation):
         """Upload before committing a pending generation; an upload cannot strand a turn."""

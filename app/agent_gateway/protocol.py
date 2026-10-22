@@ -11,6 +11,7 @@ from referencing import Registry
 
 from .upstream import PUBLIC_MODEL
 from .media import ImageError, ImagePrompt, normalize_image
+from .model_map import known as model_known
 
 # Full client context bound; the per-turn upstream payload is bounded separately in sessions.py.
 MAX_INPUT_CHARS = int(os.getenv("NOTION_GATEWAY_MAX_INPUT_CHARS", "4000000"))
@@ -165,7 +166,7 @@ def auto_mode_verdict(body: dict, options: dict):
 
 
 def prepare_request(body: dict):
-    if body.get("model") not in ALIASES:
+    if body.get("model") not in ALIASES and not model_known(body.get("model")):
         raise ProtocolError("Only claude-opus-5-5 is supported; no silent model fallback")
     if not isinstance(body.get("max_tokens"), int) or body["max_tokens"] < 1:
         raise ProtocolError("max_tokens must be a positive integer")

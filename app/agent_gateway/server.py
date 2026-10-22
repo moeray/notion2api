@@ -22,6 +22,7 @@ from .protocol import (ProtocolError, prepare_request, parse_answer, estimate_to
                        answer_options, finalize_answer, auto_mode_verdict)
 from .upstream import NotionAgent, UpstreamError, PUBLIC_MODEL
 from .responses import PICKER_MODEL, convert_request, convert_answer, response_object, output_events, response_usage
+from .model_map import resolve as resolve_model, entries as model_entries, known as model_known
 from .routing import passthrough, HOP_HEADERS
 from .sessions import SessionStore, client_session, is_away_summary
 from .config import ROOT, LOCAL, PROFILE, PROFILE_LOCAL, PROFILES, CATALOG, profile_path
@@ -140,9 +141,14 @@ async def hello():
 @app.get("/v1/models")
 @app.get("/claude/v1/models")
 async def models():
-    return {"data": [{"type": "model", "id": PICKER_MODEL, "display_name": "Notion Opus 5.5",
-                      "created_at": "2026-10-18T00:00:00Z"}], "has_more": False,
-            "first_id": PICKER_MODEL, "last_id": PICKER_MODEL}
+    # PATCHED-BY-OPS: expose every model the workspace offers (model_map.json)
+    # instead of the single hard-coded Opus 5.5 entry.
+    items = model_entries() or [(PICKER_MODEL, PICKER_MODEL)]
+    data = [{"type": "model", "id": slug, "display_name": slug,
+             "created_at": "2026-10-18T00:00:00Z"} for slug, _ in items]
+    return {"data": data, "has_more": False,
+            "first_id": data[0]["id"] if data else None,
+            "last_id": data[-1]["id"] if data else None}
 
 
 @app.get("/v1/notion/usage")
@@ -230,7 +236,9 @@ async def messages(request: Request):
             async with session_lock(session_key):
                 result, info = await app.state.pool.run(app.state.sessions, session_key, prompt, effort, render,
                                                         progress, stateless=session_source == "side-request",
-                                                        preserve_history=preserve_history, decorate=decorate)
+                                                          preserve_history=preserve_history,
+                                                          decorate=decorate,
+                                                          model=resolve_model(body.get("model")))
             result = {**result, "id": message_id}
             audit({"id": message_id, "event": "completed", "model": PUBLIC_MODEL,
                    **info, "session_source": session_source, "duration_s": round(time.monotonic() - started, 2),
@@ -297,21 +305,19 @@ async def count_tokens(request: Request):
 
 @app.get("/codex/models")
 async def codex_models(request: Request):
-    snapshot_path = LOCAL / "codex-models.json"
-    snapshot = json.loads((snapshot_path if snapshot_path.exists() else CATALOG).read_text())
-    route = app.state.routes.get("codex")
-    if route and request.headers.get("authorization"):
-        headers = {k: v for k, v in request.headers.items() if k.lower() not in HOP_HEADERS | {"cookie", "x-api-key"}}
-        try:
-            res = await app.state.proxy_http.get(route["base_url"].rstrip("/") + "/models",
-                                                 headers=headers, params=list(request.query_params.multi_items()), timeout=15)
-            data = res.json() if res.status_code == 200 else {}
-            if isinstance(data.get("models"), list) and data["models"]:
-                custom = json.loads(CATALOG.read_text())["models"][0]
-                return JSONResponse({"models": [m for m in data["models"] if m.get("slug") != PICKER_MODEL] + [custom]})
-        except (httpx.HTTPError, ValueError):
-            pass
-    return JSONResponse(snapshot, headers={"x-notion-catalog-source": "local-snapshot"})
+    # PATCHED-BY-OPS: emit one catalog entry per model in model_map.json, reusing
+    # the shipped Opus 5.5 entry as the template (context window, tool support,
+    # reasoning levels). Previously this returned a single hard-coded model.
+    base = json.loads(CATALOG.read_text())["models"][0]
+    items = model_entries() or [(PICKER_MODEL, PICKER_MODEL)]
+    models = []
+    for slug, _upstream in items:
+        entry = dict(base)
+        entry["slug"] = slug
+        entry["display_name"] = slug
+        entry["description"] = "Notion AI model " + slug
+        models.append(entry)
+    return JSONResponse({"models": models}, headers={"x-notion-catalog-source": "model-map"})
 
 
 @app.post("/codex/responses/compact")
@@ -334,7 +340,7 @@ async def responses(request: Request):
         body = json.loads(raw)
         if request.url.path.startswith("/codex/") and body.get("model") != PICKER_MODEL:
             return await passthrough(request, bytes(raw), "codex", "responses")
-        if body.get("model") not in {PICKER_MODEL, PUBLIC_MODEL}:
+        if body.get("model") not in {PICKER_MODEL, PUBLIC_MODEL} and not model_known(body.get("model")):
             raise ProtocolError("Unsupported Notion model")
         prompt, tools, choice, effort, mapping = convert_request(body)
     except ProtocolError as exc:
@@ -360,7 +366,8 @@ async def responses(request: Request):
         started = time.monotonic()
         try:
             async with session_lock(session_key):
-                result, info = await app.state.pool.run(app.state.sessions, session_key, prompt, effort, render)
+                result, info = await app.state.pool.run(app.state.sessions, session_key, prompt, effort, render,
+                                                  model=resolve_model(body.get("model")))
             result = {**result, "id": response_id, "created_at": initial["created_at"]}
             audit({"id": response_id, "event": "completed", "protocol": "responses", "model": body["model"],
                    **info, "session_source": session_source, "duration_s": round(time.monotonic() - started, 2),

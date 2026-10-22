@@ -9,3 +9,7 @@ httpx
 websocket-client
 jsonschema
 tomlkit
+# PATCHED-BY-OPS: Notion's edge rejects httpx's TLS fingerprint on the agent
+# endpoints (createAgentThread -> 400 UserValidationError). curl_cffi
+# impersonates Chrome's TLS/JA3 and works; see agent_gateway/upstream.py.
+curl_cffi

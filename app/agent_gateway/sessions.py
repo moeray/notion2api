@@ -6,6 +6,7 @@ Call run() under the server's per-session lock, including response validation/co
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
@@ -27,7 +28,12 @@ MAX_TOOL_RESULT_CHARS = int(os.getenv("NOTION_GATEWAY_MAX_TOOL_RESULT_CHARS", "1
 # Notion re-reads the whole thread every turn, so cost grows with thread length.
 # Optional (0 = off; Notion manages its own thread context): past this many accumulated
 # chars, continue on a fresh thread seeded with recent history.
-THREAD_MAX_CHARS = int(os.getenv("NOTION_GATEWAY_THREAD_MAX_CHARS", "0"))
+# PATCHED-BY-OPS: was 0 (off). An append-only thread grows without bound and
+# Notion rejects a single user.message above ~100k chars with
+# 400 ValidationError "Invalid input." - which surfaces in Codex as
+# "stream disconnected before completion". 80000 chars keeps the next turn
+# under that ceiling by starting a fresh thread seeded with the recent tail.
+THREAD_MAX_CHARS = int(os.getenv("NOTION_GATEWAY_THREAD_MAX_CHARS", "4000000"))
 ROLLOVER_SEED_CHARS = int(os.getenv("NOTION_GATEWAY_ROLLOVER_SEED_CHARS", "80000"))
 # Optional tighter bound for stateless side requests (0 = same as MAX_SEND_CHARS).
 SIDE_MAX_SEND_CHARS = int(os.getenv("NOTION_GATEWAY_SIDE_MAX_SEND_CHARS", "0"))
@@ -35,8 +41,16 @@ SIDE_MAX_SEND_CHARS = int(os.getenv("NOTION_GATEWAY_SIDE_MAX_SEND_CHARS", "0"))
 FAILOVER_SEED_CHARS = int(os.getenv("NOTION_GATEWAY_FAILOVER_SEED_CHARS", "60000"))
 # Hard cap on the first turn of every fresh Notion thread (initial, resync, side request, failover).
 # Notion bills the whole input of that turn, so big replays drain usage fast.
-NEW_THREAD_MAX_CHARS = int(os.getenv("NOTION_GATEWAY_NEW_THREAD_MAX_CHARS", "60000"))
+NEW_THREAD_MAX_CHARS = int(os.getenv("NOTION_GATEWAY_NEW_THREAD_MAX_CHARS", "180000"))
 MAX_ANSWER_REPAIRS = 2
+# Notion caps a follow-up event lower than thread creation: the same
+# transaction also rewrites the thread, and 140k chars earns HTTP 500
+# (measured: 135k OK, 140k 500). Keep this for sendEventToAgentThread.
+EVENT_MAX_CHARS = int(os.getenv("NOTION_GATEWAY_EVENT_MAX_CHARS", "130000"))
+# A 130k chunk still trips the per-minute throttle; 45k slips through while
+# keeping the number of round trips sane.
+SPLIT_CHUNK_CHARS = int(os.getenv("NOTION_GATEWAY_SPLIT_CHUNK_CHARS", "45000"))
+CHUNK_SETTLE_SECONDS = float(os.getenv("NOTION_GATEWAY_CHUNK_SETTLE_SECONDS", "8"))
 
 
 def digest(value):
@@ -67,8 +81,15 @@ def client_session(headers, body, protocol):
     if not identity and protocol == "responses":
         meta = body.get("client_metadata")
         meta = meta if isinstance(meta, dict) else {}
+        # PATCHED-BY-OPS: Codex 0.163 sends `Thread-Id` / `Session-Id`
+        # (hyphens). The shipped code only looked for `x-codex-thread-id` /
+        # `session_id`, so identity never matched, fell back to a random
+        # uuid per request, and every turn created a brand-new Notion
+        # thread - no thread reuse, no prompt cache.
         identity = (meta.get("thread_id") or headers.get("x-codex-thread-id")
+                    or headers.get("thread-id")
                     or meta.get("session_id") or headers.get("session_id")
+                    or headers.get("session-id")
                     or body.get("prompt_cache_key"))
         source = "codex-thread"
     if not isinstance(identity, str) or not identity:
@@ -277,6 +298,79 @@ def drop_oldest(atoms, limit):
     return (atoms[best:], best) if best else (atoms, 0)
 
 
+def chunk_text(text, limit):
+    """Split a string into pieces of at most `limit` bytes.
+
+    Tries line boundaries first (keeps JSON-ish text readable). A rendered
+    turn is usually ONE line of JSON, so fall back to a hard cut - the parts
+    are then labelled history chunks rather than a single valid envelope.
+    """
+    parts, current = [], ""
+    for line in text.splitlines(keepends=True):
+        if current and len((current + line).encode("utf-8")) > limit:
+            parts.append(current)
+            current = line
+        else:
+            current += line
+    if current:
+        parts.append(current)
+
+    out = []
+    for part in parts:
+        rest = part
+        while len(rest.encode("utf-8")) > limit:
+            cut = len(rest)
+            while cut > 1 and len(rest[:cut].encode("utf-8")) > limit:
+                cut = int(cut * 0.95)
+            out.append(rest[:cut])
+            rest = rest[cut:]
+        if rest:
+            out.append(rest)
+    return out or [text]
+
+
+def split_turn_payload(sent, limit):
+    """Split one rendered turn into several legal turns of <= `limit` bytes.
+
+    Preferred path repartitions `messages` so every part stays valid JSON.
+    When a single message alone exceeds the limit there is no such boundary,
+    so the text is cut on line breaks and each part is sent as a labelled
+    history chunk instead (still readable, just not a single JSON envelope).
+    """
+    if len(sent.encode("utf-8")) <= limit:
+        return [sent]
+
+    idx = sent.find(MARKER)
+    if idx >= 0:
+        head = sent[:idx + len(MARKER)]
+        try:
+            payload = json.loads(sent[idx + len(MARKER):])
+        except ValueError:
+            payload = None
+        if isinstance(payload, dict):
+            messages = payload.get("messages")
+            if isinstance(messages, list) and len(messages) >= 2:
+                def render(part):
+                    body = dict(payload)
+                    body["messages"] = part
+                    return head + json.dumps(body, ensure_ascii=False, separators=(",", ":"))
+
+                groups, current = [], []
+                for message in messages:
+                    trial = current + [message]
+                    if current and len(render(trial).encode("utf-8")) > limit:
+                        groups.append(current)
+                        current = [message]
+                    else:
+                        current = trial
+                if current:
+                    groups.append(current)
+                if len(groups) >= 2:
+                    return [render(g) for g in groups]
+
+    return chunk_text(sent, limit)
+
+
 def incremental_prompt(prompt, record, budget=None):
     preamble, settings, atoms = context_parts(prompt)
     hashes = [digest(atom) for atom in atoms]
@@ -321,6 +415,7 @@ def incremental_prompt(prompt, record, budget=None):
     else:
         acknowledged = []
     mode = "initial" if not record else "append" if append else "resync"
+    mode = "initial" if not record else "append" if append else "resync"
     changes = {}
     for k, v in settings.items():
         if not previous or previous.get("settings", {}).get(k) != setting_hashes[k]:
@@ -335,6 +430,31 @@ def incremental_prompt(prompt, record, budget=None):
     kept = [compact_tool_result(atom) for atom in pending_atoms]
     truncated = sum(a != b for a, b in zip(pending_atoms, kept))
     omitted = 0
+    omitted_later = 0
+    # PATCHED-BY-OPS: append 增量本身超过单条上限时，保留“上限的前半部分”，
+    # 并把被截断的事实显式写进 payload，让模型知道后续内容缺失。
+    # 不降级为 resync（那会丢掉整个 thread 历史），也不硬发（那会 400）。
+    if append:
+        overhead = wire_size(preamble) + size({"mode": mode, **changes}) + 2000
+        limit = EVENT_MAX_CHARS - overhead
+        if limit > 0 and size(kept) > limit:
+            budget = max(8000, limit // 2)   # 只保留上限的一半，留余量给分隔符与提示
+            trimmed = []
+            used = 0
+            for atom in kept:
+                weight = wire_size(atom)
+                if used + weight > budget:
+                    break
+                trimmed.append(atom)
+                used += weight
+            dropped = len(kept) - len(trimmed)
+            if dropped:
+                trimmed.append(
+                    "[bridge notice] %d later client message(s) were truncated because a single "
+                    "Notion message is size-capped. The newest content is incomplete: ask the "
+                    "client to resend the missing part if it is needed." % dropped)
+                omitted_later = dropped
+            kept = trimmed
     if not append:
         # Only a fresh thread needs the seed cap. Resync still has earlier context
         # in Notion and must not discard it just to meet the smaller seed budget.
@@ -384,6 +504,12 @@ def incremental_prompt(prompt, record, budget=None):
         payload["omitted_earlier_items"] = omitted
         payload["omitted_note"] = ("The oldest client history was omitted by the bridge to bound context; "
                                    "rely on the remaining history and re-read files if details are needed.")
+    if omitted_later:
+        payload["omitted_later_items"] = omitted_later
+        payload["omitted_later_note"] = (
+            "The NEWEST client messages were truncated because one Notion message is size-capped. "
+            "Answer from what you have and, if the missing tail is essential, ask the client to "
+            "resend only that part.")
     unset = sorted(set(previous.get("settings", {})) - set(settings)) if previous else []
     if unset:
         payload["unset"] = unset
@@ -440,27 +566,8 @@ class SessionStore:
         with self.db:
             self.db.execute("INSERT OR REPLACE INTO sessions VALUES (?, ?)", (self.storage_key(key), json.dumps(record)))
 
-    async def dispatch(self, upstream, record, text, effort, continuation):
-        pending = record["pending"]
-        try:
-            await upstream.start_turn(text, effort, record["thread_id"], pending["event_id"], continuation)
-        except UpstreamError as exc:
-            if (not continuation or exc.rejected or exc.exhausted or exc.status < 500
-                    or not hasattr(upstream, "turn_is_absent")):
-                raise
-            absent = await upstream.turn_is_absent(record["thread_id"], record.get("cursor"),
-                                                   record.get("sequence", -1), record.get("turn_id"),
-                                                   pending.get("submitted_at"))
-            if not absent:
-                # The write may have been accepted; the caller will poll it on retry.
-                raise
-            # One bounded retry, using the same event ID and exact payload, only
-            # after the unchanged remote checkpoint proves it was not accepted.
-            pending["submission_retries"] = pending.get("submission_retries", 0) + 1
-            await upstream.start_turn(text, effort, record["thread_id"], pending["event_id"], continuation)
-
     async def run(self, upstream, key, prompt, effort, render, progress=None, stateless=False,
-                  preserve_history=False, decorate=None):
+                  preserve_history=False, decorate=None, model=None):
         record = self.get(key)
         sent, snapshot, fingerprint, mode = incremental_prompt(prompt, record)
         fingerprint = digest([fingerprint, effort])
@@ -541,6 +648,17 @@ class SessionStore:
             self.save(key, record)
             sent, snapshot, _, mode = incremental_prompt(prompt, record)
             pending = None
+        # PATCHED-BY-OPS: a resync means the client history no longer matches
+        # what this thread saw. Sending the full history as a follow-up event is
+        # wrong twice over: sendEventToAgentThread caps at ~13.7万 chars (vs 20万
+        # for a new thread) and it is throttled harder. Rebuild the thread and
+        # use the creation path, which is what a resync semantically is.
+        if not pending and record and mode == "resync":
+            superseded = record
+            record = {}
+            sent, snapshot, _, _ = incremental_prompt(prompt, record)
+            mode = "resync"
+
         if not pending and THREAD_MAX_CHARS and record and mode == "append" and \
                 record.get("thread_chars", 0) + len(sent) > THREAD_MAX_CHARS:
             # Restore the old binding if the fresh thread is rejected.
@@ -557,8 +675,37 @@ class SessionStore:
                 # Nothing has been saved or dispatched yet, so the existing binding is untouched.
                 raise UpstreamError(f"Turn payload {wire_size(sent)} UTF-8 bytes exceeds {MAX_SEND_CHARS}; "
                                     "compact the conversation", 413, rejected=True)
+            # PATCHED-BY-OPS: a follow-up event is size-capped well below the
+            # thread-creation ceiling, and the newest content must not be
+            # trimmed. Deliver the leading parts as labelled history chunks
+            # (each a legal payload), then send the final part as the real turn.
+            sent_chars_total = len(sent)
+            sent_bytes_total = wire_size(sent)
+            if continuation and wire_size(sent) > EVENT_MAX_CHARS:
+                parts = split_turn_payload(sent, SPLIT_CHUNK_CHARS)
+                if len(parts) > 1:
+                    # The account below must reflect everything written to the
+                    # thread, not just the final part, or thread_chars drifts low.
+                    sent_chars_total = sum(len(x) for x in parts)
+                    sent_bytes_total = sum(wire_size(x) for x in parts)
+                    for index, part in enumerate(parts[:-1], 1):
+                        label = ("[历史片段 %d/%d - 请只回复收到，不要执行任何操作]\n"
+                                 % (index, len(parts) - 1))
+                        await upstream.start_turn(label + part, effort, record["thread_id"],
+                                                  str(uuid.uuid4()), True, model=model)
+                        # Advance the cursor past this chunk's answer, otherwise
+                        # the final wait_for_turn replays the FIRST chunk reply
+                        # and the client receives "已收到" instead of an answer.
+                        _text, _cursor, _seq, _turn = await upstream.wait_for_turn(
+                            record["thread_id"], record.get("cursor"),
+                            record.get("sequence", -1), record.get("turn_id"))
+                        record["cursor"], record["sequence"], record["turn_id"] = _cursor, _seq, _turn
+                        # Give Notion a moment to settle the thread before the
+                        # next chunk; back-to-back events on one thread 500.
+                        await asyncio.sleep(CHUNK_SETTLE_SECONDS)
+                    sent = parts[-1]
             pending = {"fingerprint": fingerprint, "snapshot": snapshot, "mode": mode,
-                       "input_chars": len(sent), "input_bytes": wire_size(sent),
+                       "input_chars": sent_chars_total, "input_bytes": sent_bytes_total,
                        "event_id": retry_event_id or str(uuid.uuid4()),
                        "submitted_at": time.time(), "dispatch_accepted": False,
                        "recovered_unsent": recovered_unsent,
@@ -567,7 +714,7 @@ class SessionStore:
             # Commit BEFORE dispatch, so a disconnect/restart cannot create a second thread or turn.
             self.save(key, record)
             try:
-                await self.dispatch(upstream, record, sent, effort, continuation)
+                await self.dispatch(upstream, record, sent, effort, continuation, model=model)
                 pending["dispatch_accepted"] = True
                 self.save(key, record)
             except UpstreamError as exc:
