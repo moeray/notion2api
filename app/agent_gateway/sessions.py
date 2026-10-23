@@ -23,7 +23,7 @@ from .media import ImagePrompt, MAX_TURN_IMAGES, images_in_messages
 MARKER = "CLIENT_CONTEXT_JSON:\n"
 # UTF-8 byte bound on actual serialized content, including JSON escaping. Notion
 # persists multiple copies; a ~200 KB request can exceed its DynamoDB item limit.
-MAX_SEND_CHARS = int(os.getenv("NOTION_GATEWAY_MAX_SEND_CHARS", "180000"))
+MAX_SEND_CHARS = int(os.getenv("NOTION_GATEWAY_MAX_SEND_CHARS", "400000"))
 MAX_TOOL_RESULT_CHARS = int(os.getenv("NOTION_GATEWAY_MAX_TOOL_RESULT_CHARS", "16000"))
 # Notion re-reads the whole thread every turn, so cost grows with thread length.
 # Optional (0 = off; Notion manages its own thread context): past this many accumulated
@@ -41,7 +41,7 @@ SIDE_MAX_SEND_CHARS = int(os.getenv("NOTION_GATEWAY_SIDE_MAX_SEND_CHARS", "0"))
 FAILOVER_SEED_CHARS = int(os.getenv("NOTION_GATEWAY_FAILOVER_SEED_CHARS", "60000"))
 # Hard cap on the first turn of every fresh Notion thread (initial, resync, side request, failover).
 # Notion bills the whole input of that turn, so big replays drain usage fast.
-NEW_THREAD_MAX_CHARS = int(os.getenv("NOTION_GATEWAY_NEW_THREAD_MAX_CHARS", "180000"))
+NEW_THREAD_MAX_CHARS = int(os.getenv("NOTION_GATEWAY_NEW_THREAD_MAX_CHARS", "380000"))
 MAX_ANSWER_REPAIRS = 2
 # Notion caps a follow-up event lower than thread creation: the same
 # transaction also rewrites the thread, and 140k chars earns HTTP 500
@@ -49,7 +49,7 @@ MAX_ANSWER_REPAIRS = 2
 EVENT_MAX_CHARS = int(os.getenv("NOTION_GATEWAY_EVENT_MAX_CHARS", "130000"))
 # A 130k chunk still trips the per-minute throttle; 45k slips through while
 # keeping the number of round trips sane.
-SPLIT_CHUNK_CHARS = int(os.getenv("NOTION_GATEWAY_SPLIT_CHUNK_CHARS", "45000"))
+SPLIT_CHUNK_CHARS = int(os.getenv("NOTION_GATEWAY_SPLIT_CHUNK_CHARS", "100000"))
 CHUNK_SETTLE_SECONDS = float(os.getenv("NOTION_GATEWAY_CHUNK_SETTLE_SECONDS", "8"))
 
 
