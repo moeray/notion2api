@@ -570,6 +570,9 @@ class SessionStore:
         truthy, so the next run would take the continuation path and then read
         record["thread_id"] -- which no longer exists.
         """
+        dead = str(record.get("thread_id") or "?")[:13]
+        print("[thread-gone] dropping session key=%s thread=%s (upstream says it "
+              "no longer exists)" % (str(key)[:12], dead), flush=True)
         with self.db:
             self.db.execute("DELETE FROM sessions WHERE key = ?", (self.storage_key(key),))
         record.clear()
